@@ -27,8 +27,7 @@ def _shingles(text: str, ngram_size: int = 3) -> list[str]:
 
 def _compute_minhash(shingles: list[str], num_perm: int) -> MinHash:
     mh = MinHash(num_perm=num_perm)
-    for sh in shingles:
-        mh.update(sh.encode("utf-8"))
+    mh.update_batch([sh.encode("utf-8") for sh in shingles[:50]])
     return mh
 
 

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 import gc
 import json
+import os
 from pathlib import Path
+import shutil
 from typing import Any
 
 import numpy as np
@@ -179,6 +182,78 @@ class _ParquetStreamWriter:
             self.writer.close()
         elif not self.path.exists():
             pd.DataFrame().to_parquet(self.path, index=False)
+
+
+def _process_single_shard_worker(task: tuple[int, str, dict[str, Any], str, str]) -> tuple[int, dict[str, int], int]:
+    """Process one shard in a worker process and emit temporary shard parquet files."""
+    shard_idx, shard_path_str, cfg, aliases_path_str, tmp_dir_str = task
+    spath = Path(shard_path_str)
+    tmp_dir = Path(tmp_dir_str)
+    loc_norm = LocationNormalizer(aliases_path_str)
+
+    c_path = tmp_dir / f"clean_{shard_idx:02d}.parquet"
+    n_path = tmp_dir / f"noisy_{shard_idx:02d}.parquet"
+    r_path = tmp_dir / f"rental_{shard_idx:02d}.parquet"
+    c_w = _ParquetStreamWriter(c_path)
+    n_w = _ParquetStreamWriter(n_path)
+    r_w = _ParquetStreamWriter(r_path)
+
+    counts = {
+        "total_raw": 0,
+        "clean": 0,
+        "noisy": 0,
+        "rental": 0,
+        "missing_or_negotiable": 0,
+        "multi_or_unknown": 0,
+        "admin_drift_count": 0,
+    }
+    pf = pq.ParquetFile(spath)
+    cols_to_read = [c for c in NEEDED_RAW_COLUMNS if c in pf.schema.names]
+    row_offset = 0
+    for batch in pf.iter_batches(batch_size=50_000, columns=cols_to_read):
+        bdf = batch.to_pandas()
+        c_df, n_df, r_df, cnts = _process_batch(bdf, shard_idx, row_offset, cfg, loc_norm)
+        row_offset += len(bdf)
+        for k, v in cnts.items():
+            counts[k] += v
+        c_w.write(c_df)
+        n_w.write(n_df)
+        r_w.write(r_df)
+        del bdf, c_df, n_df, r_df
+
+    c_rows = c_w.rows_written
+    c_w.close()
+    n_w.close()
+    r_w.close()
+    gc.collect()
+    return shard_idx, counts, c_rows
+
+
+def _merge_shard_parquets(part_paths: list[Path], out_path: Path) -> int:
+    """Merge per-shard parquet files sequentially without holding entire tables in RAM."""
+    writer: pq.ParquetWriter | None = None
+    target_schema: pa.Schema | None = None
+    total_rows = 0
+    for p in part_paths:
+        if not p.exists():
+            continue
+        pf = pq.ParquetFile(p)
+        if pf.metadata.num_rows == 0:
+            continue
+        for rg_idx in range(pf.num_row_groups):
+            tbl = pf.read_row_group(rg_idx)
+            if writer is None:
+                target_schema = tbl.schema
+                writer = pq.ParquetWriter(out_path, target_schema, compression="snappy")
+            elif tbl.schema != target_schema:
+                tbl = tbl.cast(target_schema)
+            writer.write_table(tbl)
+            total_rows += tbl.num_rows
+    if writer is not None:
+        writer.close()
+    elif not out_path.exists():
+        pd.DataFrame().to_parquet(out_path, index=False)
+    return total_rows
 
 
 def _compute_train_ppm2_diagnostics(
@@ -443,15 +518,13 @@ def run_prepare_data(
     else:
         shard_paths = list(raw_shards)
 
-    loc_norm = LocationNormalizer(paths["aliases_path"])
-
     clean_path = paths["processed_dir"] / "clean.parquet"
     noisy_path = paths["processed_dir"] / "noisy_flagged.parquet"
     rental_path = paths["processed_dir"] / "rental_unknown.parquet"
-
-    clean_writer = _ParquetStreamWriter(clean_path)
-    noisy_writer = _ParquetStreamWriter(noisy_path)
-    rental_writer = _ParquetStreamWriter(rental_path)
+    tmp_shards_dir = paths["processed_dir"] / "_tmp_shards"
+    if tmp_shards_dir.exists():
+        shutil.rmtree(tmp_shards_dir)
+    tmp_shards_dir.mkdir(parents=True, exist_ok=True)
 
     funnel = {
         "total_raw": 0,
@@ -463,25 +536,30 @@ def run_prepare_data(
         "admin_drift_count": 0,
     }
 
-    for shard_idx, spath in enumerate(shard_paths):
-        pf = pq.ParquetFile(spath)
-        cols_to_read = [c for c in NEEDED_RAW_COLUMNS if c in pf.schema.names]
-        row_offset = 0
-        for batch in pf.iter_batches(batch_size=50_000, columns=cols_to_read):
-            bdf = batch.to_pandas()
-            c_df, n_df, r_df, cnts = _process_batch(bdf, shard_idx, row_offset, cfg, loc_norm)
-            row_offset += len(bdf)
+    worker_tasks = [
+        (shard_idx, str(spath), cfg, str(paths["aliases_path"]), str(tmp_shards_dir))
+        for shard_idx, spath in enumerate(shard_paths)
+    ]
+    if len(shard_paths) >= 4:
+        n_workers = min(6, len(shard_paths), max(1, (os.cpu_count() or 2) // 2))
+        print(f"[TV1] Processing {len(shard_paths)} shards in parallel (workers={n_workers})...", flush=True)
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            for shard_idx, cnts, _ in pool.map(_process_single_shard_worker, worker_tasks):
+                print(f"[TV1] Finished shard {shard_idx + 1}/{len(shard_paths)}: raw={cnts['total_raw']:,}, clean={cnts['clean']:,}", flush=True)
+                for k, v in cnts.items():
+                    funnel[k] += v
+    else:
+        for task in worker_tasks:
+            shard_idx, cnts, _ = _process_single_shard_worker(task)
+            print(f"[TV1] Finished shard {shard_idx + 1}/{len(shard_paths)}: raw={cnts['total_raw']:,}, clean={cnts['clean']:,}", flush=True)
             for k, v in cnts.items():
                 funnel[k] += v
-            clean_writer.write(c_df)
-            noisy_writer.write(n_df)
-            rental_writer.write(r_df)
-            del bdf, c_df, n_df, r_df
-        gc.collect()
 
-    clean_writer.close()
-    noisy_writer.close()
-    rental_writer.close()
+    clean_rows_written = _merge_shard_parquets([tmp_shards_dir / f"clean_{i:02d}.parquet" for i in range(len(shard_paths))], clean_path)
+    _merge_shard_parquets([tmp_shards_dir / f"noisy_{i:02d}.parquet" for i in range(len(shard_paths))], noisy_path)
+    _merge_shard_parquets([tmp_shards_dir / f"rental_{i:02d}.parquet" for i in range(len(shard_paths))], rental_path)
+    shutil.rmtree(tmp_shards_dir, ignore_errors=True)
+    print(f"[TV1] Pass 1 done. Funnel: {funnel}", flush=True)
 
     # Pass 2: Read lightweight columns ONLY from clean.parquet for dedup & split creation
     dedup_cols = [
@@ -500,7 +578,7 @@ def run_prepare_data(
         "y_true",
         "text_masked",
     ]
-    if clean_writer.rows_written > 0:
+    if clean_rows_written > 0:
         pf_clean = pq.ParquetFile(clean_path)
         meta_parts = []
         for batch in pf_clean.iter_batches(batch_size=100_000, columns=dedup_cols):
@@ -509,6 +587,7 @@ def run_prepare_data(
             bdf["text_masked"] = bdf["text_masked"].astype(str).str.slice(0, 300)
             meta_parts.append(bdf)
         clean_meta = pd.concat(meta_parts, axis=0, ignore_index=True)
+        print(f"[TV1] Running dedup on {len(clean_meta):,} clean rows...", flush=True)
         clean_meta["dup_group_id"] = assign_duplicate_groups(
             clean_meta,
             threshold=float(cfg["dedup"]["minhash_threshold"]),

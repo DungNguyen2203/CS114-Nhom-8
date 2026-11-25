@@ -61,16 +61,22 @@ _RESIDUAL_MONEY_RE = re.compile(
 )
 
 
+_MONEY_HINT_RE = re.compile(r"(?:tỷ|tỉ|ty|triệu|tr|củ|ngàn|nghìn|vnđ|vnd|đồng|k\s*/)", re.IGNORECASE)
+
+
 def mask_money_text(text: Any, token: str = "MASK_GIA") -> str:
     """Replace all money mentions with `token` while keeping area, floor, room, and street numbers."""
     s = normalize_text(text)
     if not s:
         return ""
+    if not _MONEY_HINT_RE.search(s):
+        return s
     for pat in _MASK_PATTERNS:
-        s = pat.sub(f" {token} ", s)
-    # Collapse repeated adjacent mask tokens & tidy spaces
-    s = re.sub(rf"(?:\b{re.escape(token)}\b\s*){{2,}}", f"{token} ", s)
-    s = re.sub(r"\s+", " ", s).strip()
+        if _MONEY_HINT_RE.search(s):
+            s = pat.sub(f" {token} ", s)
+    if token in s:
+        s = re.sub(rf"(?:\b{re.escape(token)}\b\s*){{2,}}", f"{token} ", s)
+        s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
