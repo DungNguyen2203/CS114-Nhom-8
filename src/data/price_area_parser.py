@@ -55,11 +55,12 @@ _PURE_RENT_CUE_RE = re.compile(
 )
 _EMBEDDED_RENT_CTX_RE = re.compile(
     r"(?:hđt|hdt|hợp\s+đồng\s+thuê|đang\s+cho\s+thuê|cho\s+thuê\s+sẵn|cho\s+thuê\s+lại|"
-    r"dòng\s+tiền(?:\s+cho\s+thuê)?|thu\s+nhập(?:\s+thuê)?|khai\s+thác\s+thuê)\s*[:\-]?\s*$",
+    r"dòng\s+tiền(?:\s+cho\s+thuê)?|thu\s+nhập(?:\s+thuê)?|khai\s+thác\s+thuê|"
+    r"lợi\s+nhuận|cam\s+kết(?:\s+lợi\s+nhuận)?|\bln)\s*[:\-]?\s*$",
     re.IGNORECASE,
 )
 _RENT_UNIT_RE = re.compile(r"(?:/\s*(?:tháng|th|t|ngày|năm)\b|\b(?:tháng|th)\b)", re.IGNORECASE)
-_UNIT_M2_RE = re.compile(r"/\s*(?:\d*\s*)?(?:m2|m²|mét(?:\s*vuông)?|m)\b", re.IGNORECASE)
+_UNIT_M2_RE = re.compile(r"(?:/\s*(?:\d*\s*)?(?:m2|m²|mét(?:\s*vuông)?|m)\b|\b1m\b)", re.IGNORECASE)
 _DISCOUNT_OR_DEPOSIT_CTX_RE = re.compile(
     r"(?:giảm(?:\s+(?:ngay|sốc|mạnh))?|bớt|cắt\s+lỗ|chiết\s+khấu|lì\s+xì|tặng|"
     r"đặt\s+cọc|cọc|trả\s+trước|chỉ\s+cần|thanh\s+toán(?:\s+trước)?|vốn(?:\s+tự\s+có)?|hỗ\s+trợ\s+vay)\s*[:\-]?\s*$",
@@ -83,13 +84,18 @@ _APPROX_X_TY_RE = re.compile(
     re.IGNORECASE,
 )
 _TY_ONLY_RE = re.compile(
-    r"(?P<ty>\d+(?:[.,]\d+)?)\s*(?:tỷ|tỉ|ty)(?P<extra>\s*hơn|\s*rưỡi)?(?P<unit_sfx>\s*/\s*(?:1\s*)?(?:m2|m²|tháng|th|t\b|căn|lô))?",
+    r"(?P<ty>\d+(?:[.,]\d+)?)\s*(?:tỷ|tỉ|ty)\b(?P<extra>\s*hơn|\s*rưỡi)?(?P<unit_sfx>\s*/\s*(?:1\s*)?(?:m2|m²|tháng|th|t\b|ngày|năm|căn|lô))?",
     re.IGNORECASE,
 )
 _TRIEU_RE = re.compile(
-    r"(?P<tr_val>\d+(?:[.,]\d+)?)\s*(?:triệu|tr|củ)(?P<unit_sfx>\s*/\s*(?:1\s*)?(?:m2|m²|mét|tháng|th|t\b|ngày|năm))?",
+    r"(?P<tr_val>\d+(?:[.,]\d+)?)\s*(?:triệu|tr|củ(?!\s+chi\b))\b(?P<unit_sfx>\s*/\s*(?:1\s*)?(?:m2|m²|mét|1m|tháng|th|t\b|ngày|năm)|\s+1m\b)?",
     re.IGNORECASE,
 )
+_DONG_RE = re.compile(
+    r"\b(?P<d_val>\d+(?:[.,]\d{3})+)\s*(?:đ|đồng|vnđ|vnd)\b(?P<unit_sfx>\s*/\s*(?:1\s*)?(?:m2|m²|mét|tháng|th|t\b|ngày|năm))?",
+    re.IGNORECASE,
+)
+_NON_TR_SUB_FOLLOW_RE = re.compile(r"^\s*(?:ngủ|pn|wc|vs|tầng|lầu|mặt|m2|m²|phòng|lô|căn|x\b|m\b)", re.IGNORECASE)
 _PRE_APPROX_RE = re.compile(r"(?:nhỉnh|hơn|tầm|khoảng|gần|từ)\s*$", re.IGNORECASE)
 
 _WORD_DIGITS = {
@@ -130,11 +136,10 @@ def _to_float(num_str: str) -> float:
 def _classify_role(text: str, start: int, end: int, unit_sfx: str | None) -> str:
     prefix = text[max(0, start - 36) : start]
     suffix = text[end : min(len(text), end + 20)]
-    sfx_full = (unit_sfx or "") + suffix
 
-    if _EMBEDDED_RENT_CTX_RE.search(prefix) or _RENT_UNIT_RE.search(unit_sfx or "") or re.match(r"^\s*/\s*(?:tháng|th|t)\b", suffix, re.IGNORECASE):
+    if _EMBEDDED_RENT_CTX_RE.search(prefix) or _RENT_UNIT_RE.search(unit_sfx or "") or re.match(r"^\s*/\s*(?:tháng|th|t|ngày|năm)\b", suffix, re.IGNORECASE):
         return "rental_income"
-    if _UNIT_M2_RE.search(unit_sfx or "") or re.match(r"^\s*/\s*(?:1\s*)?(?:m2|m²|mét)\b", suffix, re.IGNORECASE):
+    if _UNIT_M2_RE.search(unit_sfx or "") or re.match(r"^\s*/\s*(?:1\s*)?(?:m2|m²|mét|1m\b)", suffix, re.IGNORECASE):
         return "unit_per_m2"
     if _DISCOUNT_OR_DEPOSIT_CTX_RE.search(prefix) and not _DISCOUNT_TO_PRICE_RE.search(prefix):
         return "deposit_or_discount"
@@ -156,9 +161,11 @@ def _extract_mentions(text: str) -> list[MoneyMention]:
         s, e = m.span()
         if _overlaps(s, e):
             continue
+        has_tr_unit = bool(m.group("tr_unit"))
+        if not has_tr_unit and _NON_TR_SUB_FOLLOW_RE.match(text[e : e + 16]):
+            continue
         ty = _to_float(m.group("ty"))
         tr_str = m.group("tr_num")
-        has_tr_unit = bool(m.group("tr_unit"))
         tr_num = float(tr_str)
         if has_tr_unit:
             sub_vnd = tr_num * 1e6
@@ -204,6 +211,20 @@ def _extract_mentions(text: str) -> list[MoneyMention]:
         if _overlaps(s, e):
             continue
         val = _to_float(m.group("tr_val")) * 1e6
+        unit_sfx = m.group("unit_sfx")
+        role = _classify_role(text, s, e, unit_sfx)
+        is_approx = bool(_PRE_APPROX_RE.search(text[max(0, s - 14) : s]))
+        mentions.append(MoneyMention(m.group(0), val, role, is_approx=is_approx, confidence="high"))
+        occupied.append((s, e))
+
+    for m in _DONG_RE.finditer(text):
+        s, e = m.span()
+        if _overlaps(s, e):
+            continue
+        digits_only = re.sub(r"[.,]", "", m.group("d_val"))
+        val = float(digits_only)
+        if val < 100_000:
+            continue
         unit_sfx = m.group("unit_sfx")
         role = _classify_role(text, s, e, unit_sfx)
         is_approx = bool(_PRE_APPROX_RE.search(text[max(0, s - 14) : s]))

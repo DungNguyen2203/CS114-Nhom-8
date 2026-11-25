@@ -29,4 +29,23 @@ def test_mask_money_masks_all_vietnamese_currency_forms():
 
 def test_find_leaked_money_catches_residual_amounts():
     assert len(find_leaked_money("Còn sót giá 4.5 ty và 60tr/m2")) >= 2
+    assert len(find_leaked_money("Giá 41.000.000đ/m2 và 6xxtr")) >= 2
     assert find_leaked_money("Nhà 4 tầng 50m2 ngõ 10 đường rộng 6m giá MASK_GIA") == []
+
+
+def test_mask_money_preserves_tret_trong_cuchi_and_masks_dong_and_x_forms():
+    text = (
+        "Nhà 1 trệt 2 lầu hẻm thẳng 1 trục, Quận 6 trong hẻm, giai đoạn 1 triển khai, "
+        "tỉnh lộ 2 Củ Chi. Giá 41.000.000đ/m2, lô đất chỉ 6xxtr, căn hộ 5.4xx tỷ."
+    )
+    masked = mask_money_text(text)
+    assert "1 trệt" in masked
+    assert "1 trục" in masked
+    assert "6 trong" in masked
+    assert "1 triển" in masked
+    assert "2 Củ Chi" in masked
+    assert "41.000.000" not in masked
+    assert "6xxtr" not in masked
+    assert "5.4xx" not in masked
+    assert find_leaked_money(masked) == []
+

@@ -107,3 +107,22 @@ def test_area_from_dimensions_ignores_road_width():
     assert abs(p.area_m2 - 48.0) < 1e-3
     rec = reconcile_labels(9_000_000_000.0, 48.0, p, DEFAULT_DOMAIN_CFG)
     assert rec.area_mismatch_flag is False
+
+
+def test_tr_prefix_words_cu_chi_and_bedrooms_not_parsed_as_price():
+    # "1 trệt", "1 trong", "6 trong", "1 triển", "2 Củ Chi" must NOT parse as 1M/6M/2M
+    p1 = parse_listing_text("Bán nhà Quận 6 trong hẻm", "Kết cấu 1 trệt 2 lầu, giai đoạn 1 triển khai, tỉnh lộ 2 Củ Chi")
+    assert p1.sale_price_vnd is None
+
+    # "5 ty 2 ngủ" -> 5.0 tỷ, NOT 5.2 tỷ!
+    p2 = parse_listing_text("Bán chung cư 5 ty 2 ngủ", "Căn hộ đẹp 70m2")
+    assert abs(p2.sale_price_vnd - 5_000_000_000.0) < 1e3
+
+    # "LN 1.3 tỷ/năm ... Giá bán từ 11 tỷ" -> total_sale is 11 tỷ, not 1.3 tỷ/năm!
+    p3 = parse_listing_text("Biệt thự Bãi Kem - LN 1.3 tỷ/năm", "Cam kết lợi nhuận 1.3 tỷ/năm. Giá bán từ 11 tỷ", tabular_area=247.0)
+    assert abs(p3.sale_price_vnd - 11_000_000_000.0) < 1e3
+
+    # "41.000.000đ/m2" -> unit price
+    p4 = parse_listing_text("Bán đất Hưng Yên 112m2", "Giá 41.000.000đ/m2 đầu tư hợp lý", tabular_area=112.0)
+    assert abs(p4.unit_price_per_m2_vnd - 41_000_000.0) < 1e3
+

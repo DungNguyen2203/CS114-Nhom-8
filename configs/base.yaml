@@ -1,6 +1,6 @@
 project:
   name: vn-realestate-valuation
-  rules_version: v1.0.0
+  rules_version: v1.0.1
   seeds: [42, 17, 2026]
   primary_seed: 42
   text_version: v1.0.0
