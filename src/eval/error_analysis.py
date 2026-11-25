@@ -31,9 +31,9 @@ def sample_error_buckets(
     """Sample good, medium, and large absolute-error listings with PII redacted."""
     cols = [
         c for c in ["row_id", "property_type_name", "province_norm", "district_norm", "area", "name_norm", "description_norm", "text_masked"]
-        if c in meta_df.columns
+        if c in meta_df.columns and (c == "row_id" or c not in pred_df.columns)
     ]
-    merged = pred_df.merge(meta_df[cols].drop_duplicates("row_id"), on="row_id", how="left")
+    merged = pred_df.merge(meta_df[cols].drop_duplicates("row_id"), on="row_id", how="left") if len(cols) > 1 else pred_df.copy()
     merged["abs_log_err"] = np.abs(merged["y_pred"] - merged["y_true"])
     merged["signed_log_err"] = merged["y_true"] - merged["y_pred"]
 
@@ -56,7 +56,9 @@ def sample_error_buckets(
         out["name_redacted"] = [redact_pii(v) for v in out["name_norm"]]
     if "description_norm" in out.columns:
         out["description_redacted"] = [redact_pii(v)[:500] for v in out["description_norm"]]
-    drop_raw = [c for c in ["name_norm", "description_norm"] if c in out.columns]
+    if "text_masked" in out.columns:
+        out["text_masked_redacted"] = [redact_pii(v)[:500] for v in out["text_masked"]]
+    drop_raw = [c for c in ["name_norm", "description_norm", "text_masked"] if c in out.columns]
     return out.drop(columns=drop_raw)
 
 

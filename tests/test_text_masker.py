@@ -49,3 +49,18 @@ def test_mask_money_preserves_tret_trong_cuchi_and_masks_dong_and_x_forms():
     assert "5.4xx" not in masked
     assert find_leaked_money(masked) == []
 
+
+def test_mask_money_handles_trailing_punctuation_single_x_and_preserves_dong_addresses():
+    text = (
+        "Nhà đường 6, Đồng Mai, Hà Đông giá chỉ 4. tỷ, căn khác 13.TỶ, 6.tỷ 350, "
+        "TC: 8.2.tỷ, 4,Tỷ 780, 40, tỷ, 5.8..tỷ, 4,.tỷ, 500.triệu, HĐT 45.Tr/Tháng, "
+        "phí 21000 đ/m2, giá 8.x, 7.x đồng, mỹ đình quanh 6, đồng, KDC 1181 Đ Lê Văn Lương, chợ 104, Đồng Nai."
+    )
+    masked = mask_money_text(text)
+    for leaked in ["4. tỷ", "13.TỶ", "6.tỷ 350", "8.2.tỷ", "4,Tỷ 780", "40, tỷ", "5.8..tỷ", "4,.tỷ", "500.triệu", "45.Tr", "21000 đ/m2", "8.x", "7.x đồng", "6, đồng"]:
+        assert leaked not in masked, f"Should have masked {leaked}: {masked}"
+    assert "Đồng Mai" in masked
+    assert "Đồng Nai" in masked
+    assert "1181 Đ Lê Văn Lương" in masked
+    assert find_leaked_money(masked) == []
+

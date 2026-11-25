@@ -13,13 +13,14 @@ import numpy as np
 import pandas as pd
 
 from src.config import load_config, resolve_project_paths, set_global_seed
+from src.data.splits import stratified_sample_df
 from src.data.text_normalizer import redact_pii
 from src.eval.conformal import fit_apply_conformal
 from src.eval.error_analysis import analyze_residual_keywords, sample_error_buckets
 from src.eval.flagger import export_flag_audit_samples, flag_mispriced_listings
 from src.eval.leakage_checks import verify_split_leakage
 from src.eval.metrics import cluster_bootstrap_mae_diff, evaluate_predictions_df
-from src.features.phobert_embedder import PhoBERTEmbedder, load_embeddings_for_row_ids
+from src.features.phobert_embedder import PhoBERTEmbedder, format_phobert_input, load_embeddings_for_row_ids
 from src.features.tabular_features import TabularFeatureExtractor
 from src.features.tfidf_features import TfidfSvdExtractor
 from src.models.catboost_utils import compute_catboost_importance, concat_dense_to_tabular
@@ -30,6 +31,7 @@ from src.models.m2_tfidf_ridge import M2TfidfRidgeModel
 from src.models.m3_phobert_ridge import M3PhoBERTRidgeModel
 from src.models.m4_tfidf_catboost import M4TfidfCatBoostModel
 from src.models.m5_phobert_catboost import M5PhoBERTCatBoostModel
+from src.models.m6_finetune import M6FineTuneRegressor
 
 
 def _slice_by_split(clean_df: pd.DataFrame, man_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
@@ -174,11 +176,12 @@ def _run_scenario_a(
     # --- M2 (TF-IDF + Ridge) ---
     m2 = M2TfidfRidgeModel(alphas=cfg["models"]["ridge_alphas"])
     m2_alpha, m2_tune = m2.tune_and_fit(X_tr_sp, y_tr, X_va_sp, y_va)
+    m2_best_sec = next((r["train_time_sec"] for r in m2_tune if float(r["alpha"]) == float(m2_alpha)), m2_tune[0]["train_time_sec"])
     for r in m2_tune:
         tuning_logs.append({"model_id": "M2", **r})
     for sp_name, sp_df, X_sp in [("val", va, X_va_sp), ("cal", ca, X_ca_sp), ("test", te, X_te_sp)]:
         yp = m2.predict(X_sp)
-        pdf = _record_model("M2", primary_seed, sp_name, sp_df, yp, train_sec=m2_tune[0]["train_time_sec"])
+        pdf = _record_model("M2", primary_seed, sp_name, sp_df, yp, train_sec=m2_best_sec)
         if sp_name == "val":
             val_mae_by_model["M2"] = float(np.mean(np.abs(yp - y_va)))
         if sp_name == "test":
@@ -187,11 +190,12 @@ def _run_scenario_a(
     # --- M3 (PhoBERT + Ridge) ---
     m3 = M3PhoBERTRidgeModel(alphas=cfg["models"]["ridge_alphas"])
     m3_alpha, m3_tune = m3.tune_and_fit(emb_tr, y_tr, emb_va, y_va)
+    m3_best_sec = next((r["train_time_sec"] for r in m3_tune if float(r["alpha"]) == float(m3_alpha)), m3_tune[0]["train_time_sec"])
     for r in m3_tune:
         tuning_logs.append({"model_id": "M3", **r})
     for sp_name, sp_df, emb_sp in [("val", va, emb_va), ("cal", ca, emb_ca), ("test", te, emb_te)]:
         yp = m3.predict(emb_sp)
-        pdf = _record_model("M3", primary_seed, sp_name, sp_df, yp, train_sec=m3_tune[0]["train_time_sec"])
+        pdf = _record_model("M3", primary_seed, sp_name, sp_df, yp, train_sec=m3_best_sec)
         if sp_name == "val":
             val_mae_by_model["M3"] = float(np.mean(np.abs(yp - y_va)))
         if sp_name == "test":
@@ -203,6 +207,7 @@ def _run_scenario_a(
     best_m4_mae = float("inf")
     best_m4 = None
     best_m4_ext = tfidf_ext
+    best_m4_sec = 0.0
     for k in feat_cfg["svd_components_candidates"]:
         ext_k = tfidf_ext if int(k) == best_svd_k else TfidfSvdExtractor(
             max_features=int(feat_cfg["tfidf_max_features"]),
@@ -228,6 +233,7 @@ def _run_scenario_a(
             best_m4 = m4_k
             best_svd_k = int(k)
             best_m4_ext = ext_k
+            best_m4_sec = t_k
     assert best_m4 is not None
     tr_svd_b = best_m4_ext.transform_svd(tr["text_masked"].tolist())
     va_svd_b = best_m4_ext.transform_svd(va["text_masked"].tolist())
@@ -242,7 +248,7 @@ def _run_scenario_a(
             learning_rate=float(m1_best_cfg["learning_rate"]),
             loss_function=str(m1_best_cfg["loss_function"]),
         )
-        t_s = 0.0 if s == primary_seed else m4_s.fit(X_tr_tab, tr_svd_b, y_tr, X_va_tab, va_svd_b, y_va, cat_cols, seed=s)
+        t_s = best_m4_sec if s == primary_seed else m4_s.fit(X_tr_tab, tr_svd_b, y_tr, X_va_tab, va_svd_b, y_va, cat_cols, seed=s)
         for sp_name, sp_df, X_sp, svd_sp in [("val", va, X_va_tab, va_svd_b), ("cal", ca, X_ca_tab, ca_svd_b), ("test", te, X_te_tab, te_svd_b)]:
             yp = m4_s.predict(X_sp, svd_sp)
             q_lo, q_hi = best_m4.predict_quantiles(X_sp, svd_sp) if s == primary_seed else (None, None)
@@ -257,6 +263,7 @@ def _run_scenario_a(
     best_pca_k = int(feat_cfg["pca_components_candidates"][0])
     best_m5_mae = float("inf")
     best_m5 = None
+    best_m5_sec = 0.0
     for k in feat_cfg["pca_components_candidates"]:
         m5_k = M5PhoBERTCatBoostModel(
             pca_components=int(k),
@@ -273,6 +280,7 @@ def _run_scenario_a(
             best_m5_mae = mae_k
             best_m5 = m5_k
             best_pca_k = int(k)
+            best_m5_sec = t_k
     assert best_m5 is not None
     best_m5.fit_quantiles(X_tr_tab, emb_tr, y_tr, X_va_tab, emb_va, y_va, cat_cols, quantiles=tuple(cb_cfg["quantiles"]), seed=primary_seed)
     m5_cal_df = None
@@ -286,7 +294,7 @@ def _run_scenario_a(
             learning_rate=float(m1_best_cfg["learning_rate"]),
             loss_function=str(m1_best_cfg["loss_function"]),
         )
-        t_s = 0.0 if s == primary_seed else m5_s.fit(X_tr_tab, emb_tr, y_tr, X_va_tab, emb_va, y_va, cat_cols, seed=s)
+        t_s = best_m5_sec if s == primary_seed else m5_s.fit(X_tr_tab, emb_tr, y_tr, X_va_tab, emb_va, y_va, cat_cols, seed=s)
         for sp_name, sp_df, X_sp, emb_sp in [("val", va, X_va_tab, emb_va), ("cal", ca, X_ca_tab, emb_ca), ("test", te, X_te_tab, emb_te)]:
             yp = m5_s.predict(X_sp, emb_sp)
             q_lo, q_hi = best_m5.predict_quantiles(X_sp, emb_sp) if s == primary_seed else (None, None)
@@ -299,11 +307,43 @@ def _run_scenario_a(
                 m5_test_df = pdf
                 pred_dfs_test["M5"] = pdf
 
+    # --- Optional M6 (End-to-End PhoBERT Fine-Tune) ---
+    m6_cfg = cfg["models"].get("m6_finetune", {})
+    if bool(m6_cfg.get("enabled", False)):
+        print("[Scenario A] Training optional M6 (End-to-End PhoBERT fine-tune)...", flush=True)
+        ph_cfg = cfg["phobert"]
+        m6 = M6FineTuneRegressor(
+            model_name=ph_cfg["model_name"],
+            revision=ph_cfg["revision"],
+            max_length=int(ph_cfg["max_length"]),
+            lr=float(m6_cfg.get("lr", 1.5e-5)),
+            epochs=int(m6_cfg.get("epochs", 2)),
+            batch_size=int(m6_cfg.get("batch_size", 16)),
+        )
+        def _fmt_df(d: pd.DataFrame) -> list[str]:
+            return [
+                format_phobert_input(pt, pr, dt, nm, dm)
+                for pt, pr, dt, nm, dm in zip(
+                    d["property_type_name"], d["province_norm"], d["district_norm"], d["name_masked"], d["description_masked"]
+                )
+            ]
+        t0_m6 = time.perf_counter()
+        m6_res = m6.fit(_fmt_df(tr), y_tr, _fmt_df(va), y_va, checkpoint_dir=paths["models_dir"] / "m6_a", seed=primary_seed)
+        t_m6 = time.perf_counter() - t0_m6
+        tuning_logs.append({"model_id": "M6", "val_mae": m6_res["best_val_mae"], "train_time_sec": t_m6})
+        for sp_name, sp_df in [("val", va), ("cal", ca), ("test", te)]:
+            yp = m6.predict(_fmt_df(sp_df))
+            pdf = _record_model("M6", primary_seed, sp_name, sp_df, yp, train_sec=t_m6)
+            if sp_name == "val":
+                val_mae_by_model["M6"] = float(np.mean(np.abs(yp - y_va)))
+            if sp_name == "test":
+                pred_dfs_test["M6"] = pdf
+
     # Select winner strictly by Validation MAE_log
     winner_id = min(val_mae_by_model, key=lambda k: val_mae_by_model[k])
     print(f"[Scenario A] Validation winner: {winner_id} ({val_mae_by_model}). Running E3 ablation...", flush=True)
 
-    # E3: Fair apple-to-apple ablation & unmasked leakage control on Scenario A
+    # E3: Fair apple-to-apple stratified ablation & unmasked leakage control on Scenario A
     e3_rows: list[dict[str, Any]] = [
         {"variant": "M1_tabular_only_full", "MAE_log": float(np.mean(np.abs(pred_dfs_test["M1"]["y_pred"] - y_te))), "n_train": len(tr), "n_test": len(te)},
         {"variant": "M4_masked_full", "MAE_log": float(np.mean(np.abs(pred_dfs_test["M4"]["y_pred"] - y_te))), "n_train": len(tr), "n_test": len(te)},
@@ -314,14 +354,20 @@ def _run_scenario_a(
     e3_va_n = min(len(va), 1500)
     e3_te_n = min(len(te), 1500)
     if e3_tr_n >= 50 and e3_va_n >= 10 and e3_te_n >= 10:
-        tr_e3 = tr.iloc[:e3_tr_n]
-        va_e3 = va.iloc[:e3_va_n]
-        te_e3 = te.iloc[:e3_te_n]
+        def _e3_stratified_idx(df_sp: pd.DataFrame, n_target: int) -> tuple[pd.DataFrame, np.ndarray]:
+            strata_cols = [c for c in ["province_norm", "property_type_name"] if c in df_sp.columns] or ["row_id"]
+            sub_idx = stratified_sample_df(df_sp.assign(_pos=np.arange(len(df_sp))), strata_cols, n_total=n_target, seed=primary_seed, id_col="row_id")
+            pos = sub_idx["_pos"].to_numpy(dtype=int)
+            return df_sp.iloc[pos].reset_index(drop=True), pos
+
+        tr_e3, tr_pos = _e3_stratified_idx(tr, e3_tr_n)
+        va_e3, va_pos = _e3_stratified_idx(va, e3_va_n)
+        te_e3, te_pos = _e3_stratified_idx(te, e3_te_n)
 
         # Same-slice M1 tabular baseline
         m1_e3 = M1CatBoostModel(iterations=int(cb_cfg["iterations"]), early_stopping_rounds=int(cb_cfg["early_stopping_rounds"]))
-        m1_e3.fit_with_config(X_tr_tab.iloc[:e3_tr_n], y_tr[:e3_tr_n], X_va_tab.iloc[:e3_va_n], y_va[:e3_va_n], cat_cols, m1_best_cfg, seed=primary_seed)
-        e3_rows.append({"variant": "M1_tabular_only_slice", "MAE_log": float(np.mean(np.abs(m1_e3.predict(X_te_tab.iloc[:e3_te_n]) - y_te[:e3_te_n]))), "n_train": e3_tr_n, "n_test": e3_te_n})
+        m1_e3.fit_with_config(X_tr_tab.iloc[tr_pos], y_tr[tr_pos], X_va_tab.iloc[va_pos], y_va[va_pos], cat_cols, m1_best_cfg, seed=primary_seed)
+        e3_rows.append({"variant": "M1_tabular_only_slice", "MAE_log": float(np.mean(np.abs(m1_e3.predict(X_te_tab.iloc[te_pos]) - y_te[te_pos]))), "n_train": e3_tr_n, "n_test": e3_te_n})
 
         # Same-slice M4 masked vs unmasked control
         m4_ext_m = TfidfSvdExtractor(max_features=int(feat_cfg["tfidf_max_features"]), min_df=int(feat_cfg["tfidf_min_df"]), ngram_range=(1, 2), svd_components=best_svd_k, seed=primary_seed)
@@ -329,8 +375,8 @@ def _run_scenario_a(
         svd_m_va = m4_ext_m.transform_svd(va_e3["text_masked"].tolist())
         svd_m_te = m4_ext_m.transform_svd(te_e3["text_masked"].tolist())
         m4_e3_m = M4TfidfCatBoostModel(iterations=int(cb_cfg["iterations"]), early_stopping_rounds=int(cb_cfg["early_stopping_rounds"]), depth=int(m1_best_cfg["depth"]), learning_rate=float(m1_best_cfg["learning_rate"]), loss_function=str(m1_best_cfg["loss_function"]))
-        m4_e3_m.fit(X_tr_tab.iloc[:e3_tr_n], svd_m_tr, y_tr[:e3_tr_n], X_va_tab.iloc[:e3_va_n], svd_m_va, y_va[:e3_va_n], cat_cols, seed=primary_seed)
-        e3_rows.append({"variant": "M4_masked_slice", "MAE_log": float(np.mean(np.abs(m4_e3_m.predict(X_te_tab.iloc[:e3_te_n], svd_m_te) - y_te[:e3_te_n]))), "n_train": e3_tr_n, "n_test": e3_te_n})
+        m4_e3_m.fit(X_tr_tab.iloc[tr_pos], svd_m_tr, y_tr[tr_pos], X_va_tab.iloc[va_pos], svd_m_va, y_va[va_pos], cat_cols, seed=primary_seed)
+        e3_rows.append({"variant": "M4_masked_slice", "MAE_log": float(np.mean(np.abs(m4_e3_m.predict(X_te_tab.iloc[te_pos], svd_m_te) - y_te[te_pos]))), "n_train": e3_tr_n, "n_test": e3_te_n})
 
         unmasked_tr_txt = [f"{a}. {b}" for a, b in zip(tr_e3["name_norm"], tr_e3["description_norm"])]
         unmasked_va_txt = [f"{a}. {b}" for a, b in zip(va_e3["name_norm"], va_e3["description_norm"])]
@@ -341,15 +387,15 @@ def _run_scenario_a(
         svd_u_va = m4_ext_u.transform_svd(unmasked_va_txt)
         svd_u_te = m4_ext_u.transform_svd(unmasked_te_txt)
         m4_e3_u = M4TfidfCatBoostModel(iterations=int(cb_cfg["iterations"]), early_stopping_rounds=int(cb_cfg["early_stopping_rounds"]), depth=int(m1_best_cfg["depth"]), learning_rate=float(m1_best_cfg["learning_rate"]), loss_function=str(m1_best_cfg["loss_function"]))
-        m4_e3_u.fit(X_tr_tab.iloc[:e3_tr_n], svd_u_tr, y_tr[:e3_tr_n], X_va_tab.iloc[:e3_va_n], svd_u_va, y_va[:e3_va_n], cat_cols, seed=primary_seed)
-        e3_rows.append({"variant": "M4_unmasked_leak_control_slice", "MAE_log": float(np.mean(np.abs(m4_e3_u.predict(X_te_tab.iloc[:e3_te_n], svd_u_te) - y_te[:e3_te_n]))), "n_train": e3_tr_n, "n_test": e3_te_n})
+        m4_e3_u.fit(X_tr_tab.iloc[tr_pos], svd_u_tr, y_tr[tr_pos], X_va_tab.iloc[va_pos], svd_u_va, y_va[va_pos], cat_cols, seed=primary_seed)
+        e3_rows.append({"variant": "M4_unmasked_leak_control_slice", "MAE_log": float(np.mean(np.abs(m4_e3_u.predict(X_te_tab.iloc[te_pos], svd_u_te) - y_te[te_pos]))), "n_train": e3_tr_n, "n_test": e3_te_n})
 
-        # Same-slice M5 masked (reuses pre-cached embeddings)
+        # Same-slice M5 masked (reuses cached formatted PhoBERT embeddings)
         m5_e3_m = M5PhoBERTCatBoostModel(pca_components=best_pca_k, iterations=int(cb_cfg["iterations"]), early_stopping_rounds=int(cb_cfg["early_stopping_rounds"]), depth=int(m1_best_cfg["depth"]), learning_rate=float(m1_best_cfg["learning_rate"]), loss_function=str(m1_best_cfg["loss_function"]))
-        m5_e3_m.fit(X_tr_tab.iloc[:e3_tr_n], emb_tr[:e3_tr_n], y_tr[:e3_tr_n], X_va_tab.iloc[:e3_va_n], emb_va[:e3_va_n], y_va[:e3_va_n], cat_cols, seed=primary_seed)
-        e3_rows.append({"variant": "M5_masked_slice", "MAE_log": float(np.mean(np.abs(m5_e3_m.predict(X_te_tab.iloc[:e3_te_n], emb_te[:e3_te_n]) - y_te[:e3_te_n]))), "n_train": e3_tr_n, "n_test": e3_te_n})
+        m5_e3_m.fit(X_tr_tab.iloc[tr_pos], emb_tr[tr_pos], y_tr[tr_pos], X_va_tab.iloc[va_pos], emb_va[va_pos], y_va[va_pos], cat_cols, seed=primary_seed)
+        e3_rows.append({"variant": "M5_masked_slice", "MAE_log": float(np.mean(np.abs(m5_e3_m.predict(X_te_tab.iloc[te_pos], emb_te[te_pos]) - y_te[te_pos]))), "n_train": e3_tr_n, "n_test": e3_te_n})
 
-        # Same-slice M5 title-only & M5 unmasked leak control
+        # Same-slice M5 title-only & M5 unmasked leak control (using identical format_phobert_input wrapper)
         e3_embedder = PhoBERTEmbedder(
             model_name=ph_cfg["model_name"],
             revision=ph_cfg["revision"],
@@ -359,19 +405,25 @@ def _run_scenario_a(
             normalize_l2=bool(ph_cfg["normalize_l2"]),
             device=cfg.get("runtime", {}).get("device", "auto"),
         )
-        emb_title_tr, _ = e3_embedder.embed_texts(tr_e3["name_masked"].tolist(), mask_token=cfg["project"]["mask_token"])
-        emb_title_va, _ = e3_embedder.embed_texts(va_e3["name_masked"].tolist(), mask_token=cfg["project"]["mask_token"])
-        emb_title_te, _ = e3_embedder.embed_texts(te_e3["name_masked"].tolist(), mask_token=cfg["project"]["mask_token"])
+        title_tr_fmt = [format_phobert_input(pt, pr, dt, nm, "") for pt, pr, dt, nm in zip(tr_e3["property_type_name"], tr_e3["province_norm"], tr_e3["district_norm"], tr_e3["name_masked"])]
+        title_va_fmt = [format_phobert_input(pt, pr, dt, nm, "") for pt, pr, dt, nm in zip(va_e3["property_type_name"], va_e3["province_norm"], va_e3["district_norm"], va_e3["name_masked"])]
+        title_te_fmt = [format_phobert_input(pt, pr, dt, nm, "") for pt, pr, dt, nm in zip(te_e3["property_type_name"], te_e3["province_norm"], te_e3["district_norm"], te_e3["name_masked"])]
+        emb_title_tr, _ = e3_embedder.embed_texts(title_tr_fmt, mask_token=cfg["project"]["mask_token"])
+        emb_title_va, _ = e3_embedder.embed_texts(title_va_fmt, mask_token=cfg["project"]["mask_token"])
+        emb_title_te, _ = e3_embedder.embed_texts(title_te_fmt, mask_token=cfg["project"]["mask_token"])
         m5_title = M5PhoBERTCatBoostModel(pca_components=best_pca_k, iterations=int(cb_cfg["iterations"]), early_stopping_rounds=int(cb_cfg["early_stopping_rounds"]), depth=int(m1_best_cfg["depth"]), learning_rate=float(m1_best_cfg["learning_rate"]), loss_function=str(m1_best_cfg["loss_function"]))
-        m5_title.fit(X_tr_tab.iloc[:e3_tr_n], emb_title_tr, y_tr[:e3_tr_n], X_va_tab.iloc[:e3_va_n], emb_title_va, y_va[:e3_va_n], cat_cols, seed=primary_seed)
-        e3_rows.append({"variant": "M5_masked_title_only_slice", "MAE_log": float(np.mean(np.abs(m5_title.predict(X_te_tab.iloc[:e3_te_n], emb_title_te) - y_te[:e3_te_n]))), "n_train": e3_tr_n, "n_test": e3_te_n})
+        m5_title.fit(X_tr_tab.iloc[tr_pos], emb_title_tr, y_tr[tr_pos], X_va_tab.iloc[va_pos], emb_title_va, y_va[va_pos], cat_cols, seed=primary_seed)
+        e3_rows.append({"variant": "M5_masked_title_only_slice", "MAE_log": float(np.mean(np.abs(m5_title.predict(X_te_tab.iloc[te_pos], emb_title_te) - y_te[te_pos]))), "n_train": e3_tr_n, "n_test": e3_te_n})
 
-        emb_unm_tr, _ = e3_embedder.embed_texts(unmasked_tr_txt, mask_token=cfg["project"]["mask_token"])
-        emb_unm_va, _ = e3_embedder.embed_texts(unmasked_va_txt, mask_token=cfg["project"]["mask_token"])
-        emb_unm_te, _ = e3_embedder.embed_texts(unmasked_te_txt, mask_token=cfg["project"]["mask_token"])
+        unm_tr_fmt = [format_phobert_input(pt, pr, dt, nm, dm) for pt, pr, dt, nm, dm in zip(tr_e3["property_type_name"], tr_e3["province_norm"], tr_e3["district_norm"], tr_e3["name_norm"], tr_e3["description_norm"])]
+        unm_va_fmt = [format_phobert_input(pt, pr, dt, nm, dm) for pt, pr, dt, nm, dm in zip(va_e3["property_type_name"], va_e3["province_norm"], va_e3["district_norm"], va_e3["name_norm"], va_e3["description_norm"])]
+        unm_te_fmt = [format_phobert_input(pt, pr, dt, nm, dm) for pt, pr, dt, nm, dm in zip(te_e3["property_type_name"], te_e3["province_norm"], te_e3["district_norm"], te_e3["name_norm"], te_e3["description_norm"])]
+        emb_unm_tr, _ = e3_embedder.embed_texts(unm_tr_fmt, mask_token=cfg["project"]["mask_token"])
+        emb_unm_va, _ = e3_embedder.embed_texts(unm_va_fmt, mask_token=cfg["project"]["mask_token"])
+        emb_unm_te, _ = e3_embedder.embed_texts(unm_te_fmt, mask_token=cfg["project"]["mask_token"])
         m5_unm = M5PhoBERTCatBoostModel(pca_components=best_pca_k, iterations=int(cb_cfg["iterations"]), early_stopping_rounds=int(cb_cfg["early_stopping_rounds"]), depth=int(m1_best_cfg["depth"]), learning_rate=float(m1_best_cfg["learning_rate"]), loss_function=str(m1_best_cfg["loss_function"]))
-        m5_unm.fit(X_tr_tab.iloc[:e3_tr_n], emb_unm_tr, y_tr[:e3_tr_n], X_va_tab.iloc[:e3_va_n], emb_unm_va, y_va[:e3_va_n], cat_cols, seed=primary_seed)
-        e3_rows.append({"variant": "M5_unmasked_leak_control_slice", "MAE_log": float(np.mean(np.abs(m5_unm.predict(X_te_tab.iloc[:e3_te_n], emb_unm_te) - y_te[:e3_te_n]))), "n_train": e3_tr_n, "n_test": e3_te_n})
+        m5_unm.fit(X_tr_tab.iloc[tr_pos], emb_unm_tr, y_tr[tr_pos], X_va_tab.iloc[va_pos], emb_unm_va, y_va[va_pos], cat_cols, seed=primary_seed)
+        e3_rows.append({"variant": "M5_unmasked_leak_control_slice", "MAE_log": float(np.mean(np.abs(m5_unm.predict(X_te_tab.iloc[te_pos], emb_unm_te) - y_te[te_pos]))), "n_train": e3_tr_n, "n_test": e3_te_n})
 
     pd.DataFrame(e3_rows).to_csv(metrics_dir / "e3_ablation.csv", index=False)
 
@@ -503,6 +555,7 @@ def _run_scenario_a(
         "uses_svd": win_kind == "M4",
         "c2_q": c2_q_val,
         "phobert": cfg["phobert"],
+        "hf_home": cfg.get("runtime", {}).get("hf_home"),
         "mask_token": cfg["project"]["mask_token"],
         "aliases_path": str(paths["aliases_path"].resolve()),
         "tabular_bounds": cfg["cleaning"]["tabular_bounds"],
@@ -570,12 +623,16 @@ def _run_scenario_b(
         return pdf
 
     # M0 on B
-    print(f"[Scenario B] Running temporal shift M0/M1/M5 + Conformal (train={len(tr):,}, test={len(te):,})...", flush=True)
+    print(f"[Scenario B] Running unseen-district M0/M1/M4/M5 + Conformal (train={len(tr):,}, test={len(te):,})...", flush=True)
+    val_mae_b: dict[str, float] = {}
     t0 = time.perf_counter()
     m0 = M0GroupMedianModel(min_group_samples=int(cfg["models"]["m0_min_group_samples"])).fit(tr)
     t_m0 = time.perf_counter() - t0
     for sp_name, sp_df in [("val", va), ("cal", ca), ("test", te)]:
-        _rec("M0", sp_name, sp_df, m0.predict(sp_df), train_sec=t_m0)
+        yp_m0 = m0.predict(sp_df)
+        _rec("M0", sp_name, sp_df, yp_m0, train_sec=t_m0)
+        if sp_name == "val":
+            val_mae_b["M0"] = float(np.mean(np.abs(yp_m0 - y_va)))
 
     # M1 on B
     m1_b = M1CatBoostModel(iterations=int(cb_cfg["iterations"]), early_stopping_rounds=int(cb_cfg["early_stopping_rounds"]))
@@ -584,11 +641,48 @@ def _run_scenario_b(
     m1_cal = m1_test = None
     for sp_name, sp_df, X_sp in [("val", va, X_va_tab), ("cal", ca, X_ca_tab), ("test", te, X_te_tab)]:
         ql, qh = m1_b.predict_quantiles(X_sp)
-        pdf = _rec("M1", sp_name, sp_df, m1_b.predict(X_sp), q_lo=ql, q_hi=qh, train_sec=t_m1)
+        yp_m1 = m1_b.predict(X_sp)
+        pdf = _rec("M1", sp_name, sp_df, yp_m1, q_lo=ql, q_hi=qh, train_sec=t_m1)
+        if sp_name == "val":
+            val_mae_b["M1"] = float(np.mean(np.abs(yp_m1 - y_va)))
         if sp_name == "cal":
             m1_cal = pdf
         if sp_name == "test":
             m1_test = pdf
+
+    # M4 on B (TF-IDF SVD strictly fit on Scenario B train)
+    feat_cfg = cfg["features"]
+    tfidf_b = TfidfSvdExtractor(
+        max_features=int(feat_cfg["tfidf_max_features"]),
+        min_df=int(feat_cfg["tfidf_min_df"]),
+        ngram_range=(1, 2),
+        svd_components=int(res_a["best_svd_k"]),
+        seed=primary_seed,
+    ).fit(tr["text_masked"].tolist(), fit_svd=True)
+    b_svd_tr = tfidf_b.transform_svd(tr["text_masked"].tolist())
+    b_svd_va = tfidf_b.transform_svd(va["text_masked"].tolist())
+    b_svd_ca = tfidf_b.transform_svd(ca["text_masked"].tolist())
+    b_svd_te = tfidf_b.transform_svd(te["text_masked"].tolist())
+    m4_b = M4TfidfCatBoostModel(
+        iterations=int(cb_cfg["iterations"]),
+        early_stopping_rounds=int(cb_cfg["early_stopping_rounds"]),
+        depth=int(m1_best_cfg["depth"]),
+        learning_rate=float(m1_best_cfg["learning_rate"]),
+        loss_function=str(m1_best_cfg["loss_function"]),
+    )
+    t_m4 = m4_b.fit(X_tr_tab, b_svd_tr, y_tr, X_va_tab, b_svd_va, y_va, cat_cols, seed=primary_seed)
+    m4_b.fit_quantiles(X_tr_tab, b_svd_tr, y_tr, X_va_tab, b_svd_va, y_va, cat_cols, quantiles=tuple(cb_cfg["quantiles"]), seed=primary_seed)
+    m4_cal = m4_test = None
+    for sp_name, sp_df, X_sp, svd_sp in [("val", va, X_va_tab, b_svd_va), ("cal", ca, X_ca_tab, b_svd_ca), ("test", te, X_te_tab, b_svd_te)]:
+        ql, qh = m4_b.predict_quantiles(X_sp, svd_sp)
+        yp_m4 = m4_b.predict(X_sp, svd_sp)
+        pdf = _rec("M4", sp_name, sp_df, yp_m4, q_lo=ql, q_hi=qh, train_sec=t_m4)
+        if sp_name == "val":
+            val_mae_b["M4"] = float(np.mean(np.abs(yp_m4 - y_va)))
+        if sp_name == "cal":
+            m4_cal = pdf
+        if sp_name == "test":
+            m4_test = pdf
 
     # M5 on B
     m5_b = M5PhoBERTCatBoostModel(
@@ -604,25 +698,35 @@ def _run_scenario_b(
     m5_cal = m5_test = None
     for sp_name, sp_df, X_sp, emb_sp in [("val", va, X_va_tab, emb_va), ("cal", ca, X_ca_tab, emb_ca), ("test", te, X_te_tab, emb_te)]:
         ql, qh = m5_b.predict_quantiles(X_sp, emb_sp)
-        pdf = _rec("M5", sp_name, sp_df, m5_b.predict(X_sp, emb_sp), q_lo=ql, q_hi=qh, train_sec=t_m5)
+        yp_m5 = m5_b.predict(X_sp, emb_sp)
+        pdf = _rec("M5", sp_name, sp_df, yp_m5, q_lo=ql, q_hi=qh, train_sec=t_m5)
+        if sp_name == "val":
+            val_mae_b["M5"] = float(np.mean(np.abs(yp_m5 - y_va)))
         if sp_name == "cal":
             m5_cal = pdf
         if sp_name == "test":
             m5_test = pdf
 
-    # Apply C0-C3 on Scenario B using the Scenario A winner family (or M1 if M1 won)
-    use_m1 = res_a["winner_id"] == "M1"
-    win_cal_b = (m1_cal if use_m1 else m5_cal).merge(ca[["row_id", "property_type_name"]], on="row_id", how="left")
-    win_test_b = (m1_test if use_m1 else m5_test).merge(te[["row_id", "property_type_name"]], on="row_id", how="left")
+    # Select Scenario B Conformal model strictly by Scenario B Validation MAE_log
+    winner_b = min(val_mae_b, key=lambda k: val_mae_b[k])
+    conformal_sources = {
+        "M1": (m1_cal, m1_test, "M1"),
+        "M4": (m4_cal, m4_test, "M4"),
+        "M5": (m5_cal, m5_test, "M5"),
+    }
+    sel_cal, sel_test, win_b_kind = conformal_sources.get(winner_b, (m5_cal, m5_test, "M5"))
+    assert sel_cal is not None and sel_test is not None
+    win_cal_b = sel_cal.merge(ca[["row_id", "property_type_name"]], on="row_id", how="left")
+    win_test_b = sel_test.merge(te[["row_id", "property_type_name"]], on="row_id", how="left")
     alpha_pri = float(cfg["conformal"]["alpha_primary"])
     min_g = int(cfg["conformal"]["c3_min_group_samples"])
 
     for m_name in ["C0", "C1", "C2", "C3"]:
         c_out = fit_apply_conformal(win_cal_b, win_test_b, method=m_name, alpha=alpha_pri, min_group_size=min_g)
         ev_c = evaluate_predictions_df(c_out, clean_df, train_df=tr, alpha=alpha_pri, min_eval_group_size=int(cfg["conformal"]["min_eval_group_size"]))
-        conformal_b.append({"scenario": "B", "model_id": "M1" if use_m1 else "M5", "alpha": alpha_pri, "method": m_name, **ev_c["overall"]})
+        conformal_b.append({"scenario": "B", "model_id": win_b_kind, "alpha": alpha_pri, "method": m_name, **ev_c["overall"]})
 
-    return {"metrics": metrics_b, "conformal_rows": conformal_b}
+    return {"winner_id": win_b_kind, "val_mae_by_model": val_mae_b, "metrics": metrics_b, "conformal_rows": conformal_b}
 
 
 def run_train_eval(cfg: dict[str, Any], paths: dict[str, Path]) -> dict[str, Any]:
@@ -652,8 +756,8 @@ def run_train_eval(cfg: dict[str, Any], paths: dict[str, Path]) -> dict[str, Any
     noisy_df = pd.read_parquet(noisy_path) if noisy_path.exists() else pd.DataFrame()
 
     # Strict leakage checks before training
-    leak_a = verify_split_leakage(man_a, text_df=clean_df[clean_df["row_id"].isin(man_a["row_id"])], scenario="A", strict_text=False)
-    leak_b = verify_split_leakage(man_b, text_df=clean_df[clean_df["row_id"].isin(man_b["row_id"])], scenario="B", strict_text=False)
+    leak_a = verify_split_leakage(man_a, text_df=clean_df[clean_df["row_id"].isin(man_a["row_id"])], scenario="A", strict_text=True)
+    leak_b = verify_split_leakage(man_b, text_df=clean_df[clean_df["row_id"].isin(man_b["row_id"])], scenario="B", strict_text=True)
     (metrics_dir / "leakage_verification.json").write_text(json.dumps({"A": leak_a, "B": leak_b}, indent=2, ensure_ascii=False), encoding="utf-8")
 
     res_a = _run_scenario_a(cfg, paths, clean_df, man_a, noisy_df)
@@ -677,8 +781,15 @@ def run_train_eval(cfg: dict[str, Any], paths: dict[str, Path]) -> dict[str, Any
 
     summary = {
         "winner_a": res_a["winner_id"],
+        "winner_b": res_b["winner_id"],
         "val_mae_a": res_a["val_mae_by_model"],
-        "leakage": {"A": leak_a["passed"], "B": leak_b["passed"], "leaks_a": leak_a["leaked_money_rows"]},
+        "val_mae_b": res_b["val_mae_by_model"],
+        "leakage": {
+            "A": leak_a["passed"],
+            "B": leak_b["passed"],
+            "leaks_a": leak_a["leaked_money_rows"],
+            "leaks_b": leak_b["leaked_money_rows"],
+        },
         "flag_audit": res_a["flag_audit_stats"],
         "latency": res_a["latency"],
     }

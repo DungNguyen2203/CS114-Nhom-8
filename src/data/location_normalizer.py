@@ -76,7 +76,7 @@ class LocationNormalizer:
         low = re.sub(r"\s+", " ", low).strip()
         if low in self.direction_aliases:
             return self.direction_aliases[low]
-        if "," in s or ";" in s or "/" in s or " - " in s:
+        if "," in s or ";" in s or "/" in s or "-" in s:
             return "Đa hướng"
         # Check if multiple cardinal words remain unmatched
         tokens = re.findall(r"(?:đông|tây|nam|bắc)", low)

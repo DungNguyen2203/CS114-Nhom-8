@@ -14,7 +14,7 @@ def test_location_normalizer_canonicalizes_districts_wards_and_directions():
             "ward_name": ["5", "P. Dĩ An", "Dịch Vọng"],
             "street_name": ["Tạ Quang Bửu", None, "Xuân Thủy"],
             "project_name": [None, "Sky Park", None],
-            "house_direction": ["Đông - Nam", "Đông, Tây Nam", None],
+            "house_direction": ["Đông - Nam", "Đông-Tây", None],
             "balcony_direction": ["Tây - Bắc", "Nam", "Đông - Bắc"],
             "description": [
                 "Nhà mặt tiền P.5 Q.8",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import time
 from typing import Any
@@ -182,6 +183,12 @@ class ValuationInferenceService:
 
     def _get_phobert(self) -> PhoBERTEmbedder:
         if self._phobert is None:
+            if "HF_HOME" not in os.environ:
+                cfg_hf = self.meta.get("hf_home")
+                if cfg_hf and (os.name != "nt" or Path(str(cfg_hf)).drive):
+                    os.environ["HF_HOME"] = str(cfg_hf)
+                elif Path("E:/hf_cache").exists():
+                    os.environ["HF_HOME"] = "E:/hf_cache"
             ph_cfg = self.meta.get("phobert", {})
             self._phobert = PhoBERTEmbedder(
                 model_name=ph_cfg.get("model_name", "vinai/phobert-base"),

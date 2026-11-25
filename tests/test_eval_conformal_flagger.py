@@ -190,3 +190,82 @@ def test_evaluate_predictions_df_preserves_subgroup_columns():
     assert "property_type_name" in dims
     assert "region_bucket" in dims
 
+
+def test_export_flag_audit_balanced_across_g1_and_g2(tmp_path):
+    n_g1 = 40
+    eval_df = pd.DataFrame(
+        {
+            "row_id": [f"00_{i}" for i in range(n_g1 * 2)],
+            "y_true": [21.0] * n_g1 + [25.0] * n_g1,
+            "y_pred": [23.0] * (n_g1 * 2),
+            "q_lo": [22.0] * (n_g1 * 2),
+            "q_hi": [24.0] * (n_g1 * 2),
+            "text_status": ["clean_consistent"] * (n_g1 * 2),
+            "area_mismatch_flag": [False] * (n_g1 * 2),
+        }
+    )
+    meta_df = pd.DataFrame(
+        {
+            "row_id": [f"00_{i}" for i in range(n_g1 * 2)],
+            "property_type_name": ["Nhà"] * (n_g1 * 2),
+            "province_norm": ["Hà Nội"] * (n_g1 * 2),
+            "district_norm": ["Cầu Giấy"] * (n_g1 * 2),
+            "area": [50.0] * (n_g1 * 2),
+            "price": [2.0e9] * n_g1 + [2.0e10] * n_g1,
+            "text_price_vnd": [2.0e9] * n_g1 + [2.0e10] * n_g1,
+            "name_norm": ["Tin G1"] * (n_g1 * 2),
+            "description_norm": ["Mô tả"] * (n_g1 * 2),
+        }
+    )
+    n_g2 = 1000
+    noisy_df = pd.DataFrame(
+        {
+            "row_id": [f"01_{i}" for i in range(n_g2)],
+            "property_type_name": ["Đất"] * n_g2,
+            "province_norm": ["Hà Nội"] * n_g2,
+            "district_norm": ["Hà Đông"] * n_g2,
+            "area": [80.0] * n_g2,
+            "price": [1.0e10] * n_g2,
+            "text_price_vnd": [1.0e9] * n_g2,
+            "text_status": ["noisy_order_of_magnitude"] * n_g2,
+            "area_mismatch_flag": [False] * n_g2,
+            "name_norm": ["Tin G2"] * n_g2,
+            "description_norm": ["Mô tả G2"] * n_g2,
+        }
+    )
+    flagged = flag_mispriced_listings(eval_df)
+    out_csv = tmp_path / "balanced_audit.csv"
+    stats = export_flag_audit_samples(flagged, meta_df, noisy_df=noisy_df, out_path=out_csv, n_per_class=60, seed=42)
+    counts = stats["subtype_counts"]
+    assert counts.get("G1:below_interval", 0) >= 15
+    assert counts.get("G1:above_interval", 0) >= 15
+
+
+def test_sample_error_buckets_no_duplicate_suffixes_and_redacts_pii():
+    pred_df = pd.DataFrame(
+        {
+            "row_id": ["00_1", "00_2", "00_3"],
+            "y_true": [22.0, 22.5, 23.0],
+            "y_pred": [22.05, 22.8, 22.0],
+            "property_type_name": ["Nhà", "Đất", "Nhà"],
+            "text_masked": ["tin 1 LH 0912345678", "tin 2", "tin 3"],
+        }
+    )
+    meta_df = pd.DataFrame(
+        {
+            "row_id": ["00_1", "00_2", "00_3"],
+            "property_type_name": ["Nhà", "Đất", "Nhà"],
+            "province_norm": ["Hà Nội", "Hồ Chí Minh", "Đà Nẵng"],
+            "district_norm": ["Cầu Giấy", "Quận 1", "Hải Châu"],
+            "area": [50.0, 60.0, 70.0],
+            "name_norm": ["N1 LH 0912345678", "N2", "N3"],
+            "description_norm": ["D1", "D2", "D3"],
+            "text_masked": ["tin 1 LH 0912345678", "tin 2", "tin 3"],
+        }
+    )
+    out = sample_error_buckets(pred_df, meta_df, n_per_bucket=1, seed=42)
+    assert "property_type_name_x" not in out.columns
+    assert "text_masked_x" not in out.columns
+    assert "property_type_name" in out.columns
+    assert "0912345678" not in out.to_string()
+

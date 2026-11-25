@@ -94,3 +94,6 @@ def test_kaggle_notebook_valid_nbformat():
     assert "extract_embeddings" in joined
     assert "train_eval" in joined
     assert "kaggle_full.yaml" in joined
+    assert "tabulate" in joined
+    pyproject_txt = Path("pyproject.toml").read_text(encoding="utf-8")
+    assert "tabulate" in pyproject_txt

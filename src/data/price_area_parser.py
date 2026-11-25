@@ -76,7 +76,7 @@ _BUNDLE_RE = re.compile(
 
 # Fast numeric money patterns (prefix approx cues checked ONLY around matches for ~5x speedup)
 _TY_TRIEU_RE = re.compile(
-    r"(?P<ty>\d+(?:[.,]\d+)?)\s*(?:tỷ|tỉ|ty)\s*(?P<tr_num>\d{1,3})\s*(?P<tr_unit>triệu|tr)?\b",
+    r"(?P<ty>\d+(?:[.,]\d+)?)[.,]?\s*(?:tỷ|tỉ|ty)\s*(?P<tr_num>\d{1,3})\s*(?P<tr_unit>triệu|tr)?\b",
     re.IGNORECASE,
 )
 _APPROX_X_TY_RE = re.compile(
@@ -84,11 +84,11 @@ _APPROX_X_TY_RE = re.compile(
     re.IGNORECASE,
 )
 _TY_ONLY_RE = re.compile(
-    r"(?P<ty>\d+(?:[.,]\d+)?)\s*(?:tỷ|tỉ|ty)\b(?P<extra>\s*hơn|\s*rưỡi)?(?P<unit_sfx>\s*/\s*(?:1\s*)?(?:m2|m²|tháng|th|t\b|ngày|năm|căn|lô))?",
+    r"(?P<ty>\d+(?:[.,]\d+)?)[.,]?\s*(?:tỷ|tỉ|ty)\b(?P<extra>\s*hơn|\s*rưỡi)?(?P<unit_sfx>\s*/\s*(?:1\s*)?(?:m2|m²|tháng|th|t\b|ngày|năm|căn|lô))?",
     re.IGNORECASE,
 )
 _TRIEU_RE = re.compile(
-    r"(?P<tr_val>\d+(?:[.,]\d+)?)\s*(?:triệu|tr|củ(?!\s+chi\b))\b(?P<unit_sfx>\s*/\s*(?:1\s*)?(?:m2|m²|mét|1m|tháng|th|t\b|ngày|năm)|\s+1m\b)?",
+    r"(?P<tr_val>\d+(?:[.,]\d+)?)[.,]?\s*(?:triệu|tr|củ(?!\s+chi\b))\b(?P<unit_sfx>\s*/\s*(?:1\s*)?(?:m2|m²|mét|1m|tháng|th|t\b|ngày|năm)|\s+1m\b)?",
     re.IGNORECASE,
 )
 _DONG_RE = re.compile(

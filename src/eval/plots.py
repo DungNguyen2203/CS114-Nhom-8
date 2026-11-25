@@ -129,6 +129,8 @@ def generate_all_figures(outputs_dir: Path, splits_dir: Path) -> list[Path]:
             axes[1].set_ylim(0, 1.05)
             axes[1].set_title("Độ phủ C2 theo Loại hình BĐS")
             axes[1].tick_params(axis="x", rotation=20)
+            for tick in axes[1].get_xticklabels():
+                tick.set_horizontalalignment("right")
             fig.tight_layout()
             p5 = figs_dir / "fig_05_coverage_subgroups.png"
             fig.savefig(p5, dpi=160)

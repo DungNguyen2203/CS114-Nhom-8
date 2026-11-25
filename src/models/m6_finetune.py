@@ -40,11 +40,19 @@ class M6FineTuneRegressor:
         va_texts: Sequence[str],
         y_va: np.ndarray,
         checkpoint_dir: Path | None = None,
+        seed: int = 42,
     ) -> dict[str, Any]:
         import torch
         import torch.nn as nn
         from torch.utils.data import DataLoader, TensorDataset
         from transformers import AutoModel, AutoTokenizer
+
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+        y_tr_arr = np.asarray(y_tr, dtype=np.float32).reshape(-1)
+        y_va_arr = np.asarray(y_va, dtype=np.float32).reshape(-1)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, revision=self.revision)
@@ -58,12 +66,12 @@ class M6FineTuneRegressor:
         enc_va = self.tokenizer(seg_va, max_length=self.max_length, truncation=True, padding=True, return_tensors="pt")
 
         tr_loader = DataLoader(
-            TensorDataset(enc_tr["input_ids"], enc_tr["attention_mask"], torch.tensor(y_tr, dtype=torch.float32)),
+            TensorDataset(enc_tr["input_ids"], enc_tr["attention_mask"], torch.tensor(y_tr_arr, dtype=torch.float32)),
             batch_size=self.batch_size,
             shuffle=True,
         )
         va_loader = DataLoader(
-            TensorDataset(enc_va["input_ids"], enc_va["attention_mask"], torch.tensor(y_va, dtype=torch.float32)),
+            TensorDataset(enc_va["input_ids"], enc_va["attention_mask"], torch.tensor(y_va_arr, dtype=torch.float32)),
             batch_size=self.batch_size * 2,
             shuffle=False,
         )
@@ -96,11 +104,12 @@ class M6FineTuneRegressor:
             with torch.no_grad():
                 for ids, mask, _ in va_loader:
                     ids, mask = ids.to(self.device), mask.to(self.device)
-                    out = self.encoder(input_ids=ids, attention_mask=mask).last_hidden_state
-                    m = mask.unsqueeze(-1).to(out.dtype)
-                    pooled = (out * m).sum(1) / m.sum(1).clamp(min=1e-6)
-                    preds_va.append(self.head(pooled).squeeze(-1).cpu().numpy())
-            val_mae = float(np.mean(np.abs(np.concatenate(preds_va) - y_va)))
+                    with torch.amp.autocast("cuda", dtype=torch.float16, enabled=self.device.type == "cuda"):
+                        out = self.encoder(input_ids=ids, attention_mask=mask).last_hidden_state
+                        m = mask.unsqueeze(-1).to(out.dtype)
+                        pooled = (out * m).sum(1) / m.sum(1).clamp(min=1e-6)
+                        preds_va.append(self.head(pooled).squeeze(-1).cpu().numpy())
+            val_mae = float(np.mean(np.abs(np.concatenate(preds_va) - y_va_arr)))
             if val_mae < best_val_mae:
                 best_val_mae = val_mae
                 best_state = {
@@ -121,6 +130,8 @@ class M6FineTuneRegressor:
 
         if self.encoder is None or self.head is None or self.tokenizer is None or self.device is None:
             raise RuntimeError("M6 model not fitted.")
+        if len(texts) == 0:
+            return np.zeros((0,), dtype=np.float64)
         seg, _ = segment_vietnamese_texts(texts)
         enc = self.tokenizer(seg, max_length=self.max_length, truncation=True, padding=True, return_tensors="pt")
         self.encoder.eval()
@@ -130,8 +141,9 @@ class M6FineTuneRegressor:
             for i in range(0, len(seg), self.batch_size * 2):
                 ids = enc["input_ids"][i : i + self.batch_size * 2].to(self.device)
                 mask = enc["attention_mask"][i : i + self.batch_size * 2].to(self.device)
-                hidden = self.encoder(input_ids=ids, attention_mask=mask).last_hidden_state
-                m = mask.unsqueeze(-1).to(hidden.dtype)
-                pooled = (hidden * m).sum(1) / m.sum(1).clamp(min=1e-6)
-                out_preds.append(self.head(pooled).squeeze(-1).cpu().numpy())
+                with torch.amp.autocast("cuda", dtype=torch.float16, enabled=self.device.type == "cuda"):
+                    hidden = self.encoder(input_ids=ids, attention_mask=mask).last_hidden_state
+                    m = mask.unsqueeze(-1).to(hidden.dtype)
+                    pooled = (hidden * m).sum(1) / m.sum(1).clamp(min=1e-6)
+                    out_preds.append(self.head(pooled).squeeze(-1).cpu().numpy())
         return np.concatenate(out_preds).astype(np.float64)

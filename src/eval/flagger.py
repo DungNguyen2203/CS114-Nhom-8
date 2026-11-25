@@ -87,13 +87,31 @@ def export_flag_audit_samples(
     )
     n_flag = min(n_per_class, len(flagged_pool))
     if n_flag > 0:
-        flag_sample = stratified_sample_df(
-            flagged_pool,
-            "audit_subtype",
-            n_total=n_flag,
-            seed=seed,
-            id_col="row_id",
+        flagged_pool["_audit_family"] = np.where(
+            flagged_pool["audit_subtype"].astype(str).str.startswith("G1:"),
+            flagged_pool["audit_subtype"].astype(str),
+            "G2",
         )
+        families = list(dict.fromkeys(flagged_pool["_audit_family"].tolist()))
+        fam_quota = max(1, n_flag // max(1, len(families)))
+        fam_parts: list[pd.DataFrame] = []
+        for fam in families:
+            fam_df = flagged_pool[flagged_pool["_audit_family"] == fam]
+            take_n = min(len(fam_df), fam_quota)
+            if fam == "G2":
+                fam_parts.append(stratified_sample_df(fam_df, "audit_subtype", n_total=take_n, seed=seed, id_col="row_id"))
+            else:
+                fam_parts.append(stratified_sample_df(fam_df, "property_type_name", n_total=take_n, seed=seed, id_col="row_id"))
+        flag_sample = pd.concat(fam_parts, axis=0, ignore_index=True) if fam_parts else flagged_pool.head(0)
+        if len(flag_sample) < n_flag:
+            rem = flagged_pool[~flagged_pool["row_id"].isin(flag_sample["row_id"])]
+            if len(rem) > 0:
+                extra = stratified_sample_df(rem, "audit_subtype", n_total=n_flag - len(flag_sample), seed=seed, id_col="row_id")
+                flag_sample = pd.concat([flag_sample, extra], axis=0, ignore_index=True)
+        if len(flag_sample) > n_flag:
+            flag_sample = flag_sample.sample(n=n_flag, random_state=seed).reset_index(drop=True)
+        if "_audit_family" in flag_sample.columns:
+            flag_sample = flag_sample.drop(columns=["_audit_family"])
     else:
         flag_sample = flagged_pool.head(0)
 

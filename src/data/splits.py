@@ -171,7 +171,7 @@ def stratified_sample_df(
                 [sampled, rem.sample(n=min(len(rem), n_total - len(sampled)), random_state=seed)],
                 axis=0,
             )
-    return sampled.reset_index(drop=True)
+    return sampled.sample(frac=1.0, random_state=seed).reset_index(drop=True)
 
 
 def apply_stratified_budget(

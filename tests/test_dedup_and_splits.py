@@ -93,3 +93,18 @@ def test_scenario_b_has_zero_district_and_dup_overlap():
             assert d1.isdisjoint(d2)
             assert g1.isdisjoint(g2)
             assert r1.isdisjoint(r2)
+
+
+def test_stratified_sample_df_is_shuffled_not_grouped_by_stratum():
+    from src.data.splits import stratified_sample_df
+
+    df = pd.DataFrame(
+        {
+            "row_id": [f"00_{i:04d}" for i in range(120)],
+            "province_norm": ["Hà Nội"] * 40 + ["Hồ Chí Minh"] * 40 + ["Đà Nẵng"] * 40,
+        }
+    )
+    sampled = stratified_sample_df(df, "province_norm", n_total=30, seed=42)
+    assert len(sampled) == 30
+    assert sampled["province_norm"].value_counts().to_dict() == {"Hà Nội": 10, "Hồ Chí Minh": 10, "Đà Nẵng": 10}
+    assert sampled.iloc[:10]["province_norm"].nunique() >= 2

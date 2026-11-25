@@ -8,7 +8,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-from huggingface_hub import hf_hub_download
 import pyarrow.parquet as pq
 
 
@@ -38,6 +37,8 @@ def download_dataset_shards(
         fname = f"shard_{idx:04d}.parquet"
         local_path = raw_dir / fname
         if not local_path.exists():
+            from huggingface_hub import hf_hub_download
+
             downloaded = hf_hub_download(
                 repo_id=repo_id,
                 filename=fname,
