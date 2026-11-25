@@ -19,8 +19,8 @@ province_aliases:
   "bà rịa - vũng tàu": "Bà Rịa - Vũng Tàu"
 
 post_2025_07_merged_cues:
-  "Bình Dương": ["tp hcm", "tp.hcm", "hồ chí minh", "tphcm"]
-  "Bà Rịa - Vũng Tàu": ["tp hcm", "tp.hcm", "hồ chí minh", "tphcm"]
+  "Bình Dương": ["tp hcm", "tp. hcm", "tp.hcm", "hồ chí minh", "tphcm"]
+  "Bà Rịa - Vũng Tàu": ["tp hcm", "tp. hcm", "tp.hcm", "hồ chí minh", "tphcm"]
   "Long An": ["tây ninh"]
 
 direction_aliases:
