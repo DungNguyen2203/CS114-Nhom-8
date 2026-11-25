@@ -597,11 +597,23 @@ def run_train_eval(cfg: dict[str, Any], paths: dict[str, Path]) -> dict[str, Any
     metrics_dir = paths["outputs_dir"] / "metrics"
     metrics_dir.mkdir(parents=True, exist_ok=True)
 
-    clean_df = pd.read_parquet(proc_dir / "clean.parquet")
-    noisy_path = proc_dir / "noisy_flagged.parquet"
-    noisy_df = pd.read_parquet(noisy_path) if noisy_path.exists() else pd.DataFrame()
     man_a = pd.read_parquet(splits_dir / "scenario_a_manifest.parquet")
     man_b = pd.read_parquet(splits_dir / "scenario_b_manifest.parquet")
+    union_ids = set(man_a["row_id"].astype(str)).union(set(man_b["row_id"].astype(str)))
+
+    import pyarrow.parquet as pq
+
+    clean_parts: list[pd.DataFrame] = []
+    pf_clean = pq.ParquetFile(proc_dir / "clean.parquet")
+    for batch in pf_clean.iter_batches(batch_size=100_000):
+        bdf = batch.to_pandas()
+        sub = bdf[bdf["row_id"].astype(str).isin(union_ids)]
+        if len(sub) > 0:
+            clean_parts.append(sub)
+    clean_df = pd.concat(clean_parts, axis=0, ignore_index=True) if clean_parts else pd.DataFrame()
+
+    noisy_path = proc_dir / "noisy_flagged.parquet"
+    noisy_df = pd.read_parquet(noisy_path) if noisy_path.exists() else pd.DataFrame()
 
     # Strict leakage checks before training
     leak_a = verify_split_leakage(man_a, text_df=clean_df[clean_df["row_id"].isin(man_a["row_id"])], scenario="A", strict_text=False)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 from pathlib import Path
 from typing import Any
@@ -66,6 +67,9 @@ def _process_batch(
 
     names = [normalize_text(v) for v in batch_df["name"]]
     descs = [normalize_text(v) for v in batch_df["description"]]
+    # Drop heavy unnormalized text columns right after normalization
+    batch_df = batch_df.drop(columns=[c for c in ["name", "description"] if c in batch_df.columns])
+
     prices = pd.to_numeric(batch_df["price"], errors="coerce").tolist()
     areas = pd.to_numeric(batch_df["area"], errors="coerce").tolist()
 
@@ -117,16 +121,21 @@ def _process_batch(
     batch_df["parser_confidence"] = confidences
     batch_df["rules_version"] = cfg["project"]["rules_version"]
 
-    # Drop raw unmasked description/name in clean/rental except keep PII-redacted snippet or separate?
-    # Note: clean needs raw unmasked text ONLY for E3 unmasked control; we keep `name_norm` + `description_norm` locally in processed.
     clean_df = batch_df[batch_df["label_bucket"] == "clean"].copy()
     clean_df["y_true"] = np.log(pd.to_numeric(clean_df["price"], errors="coerce"))
     clean_df["price_per_m2"] = pd.to_numeric(clean_df["price"], errors="coerce") / pd.to_numeric(clean_df["area"], errors="coerce")
 
-    noisy_df = batch_df[batch_df["label_bucket"] == "noisy"].copy()
+    compact_cols = [
+        c for c in [
+            "row_id", "property_type_name", "province_norm", "district_norm",
+            "price", "area", "published_at", "tx_type", "label_bucket", "text_status",
+            "text_price_vnd", "text_area_m2", "name_norm", "description_norm",
+        ] if c in batch_df.columns
+    ]
+    noisy_df = batch_df[batch_df["label_bucket"] == "noisy"][compact_cols].copy()
     rental_unknown_df = batch_df[
         batch_df["label_bucket"].isin(["rental", "missing_or_negotiable", "multi_or_unknown"])
-    ].copy()
+    ][compact_cols].copy()
 
     counts = {
         "total_raw": n,
@@ -140,12 +149,44 @@ def _process_batch(
     return clean_df, noisy_df, rental_unknown_df, counts
 
 
+class _ParquetStreamWriter:
+    """Append pandas DataFrames to a single Parquet file with unified schema and minimal RAM."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.writer: pq.ParquetWriter | None = None
+        self.schema: pa.Schema | None = None
+        self.rows_written: int = 0
+
+    def write(self, df: pd.DataFrame) -> None:
+        if len(df) == 0:
+            return
+        # Ensure consistent object/string columns across batches
+        for col in df.columns:
+            if pd.api.types.is_string_dtype(df[col]) or df[col].dtype == object:
+                df[col] = df[col].fillna("").astype(str)
+        table = pa.Table.from_pandas(df, preserve_index=False)
+        if self.writer is None:
+            self.schema = table.schema
+            self.writer = pq.ParquetWriter(self.path, self.schema, compression="snappy")
+        else:
+            table = table.cast(self.schema)
+        self.writer.write_table(table)
+        self.rows_written += len(df)
+
+    def close(self) -> None:
+        if self.writer is not None:
+            self.writer.close()
+        elif not self.path.exists():
+            pd.DataFrame().to_parquet(self.path, index=False)
+
+
 def _compute_train_ppm2_diagnostics(
-    clean_df: pd.DataFrame,
+    clean_meta_df: pd.DataFrame,
     manifest_df: pd.DataFrame,
     quantiles: list[float],
 ) -> list[dict[str, Any]]:
-    merged = manifest_df.merge(clean_df[["row_id", "price_per_m2"]], on="row_id", how="left")
+    merged = manifest_df.merge(clean_meta_df[["row_id", "price_per_m2"]], on="row_id", how="left")
     train_part = merged[merged["split"] == "train"]
     lo_q, hi_q = float(quantiles[0]), float(quantiles[1])
     bounds = (
@@ -176,36 +217,53 @@ def _compute_train_ppm2_diagnostics(
     return rows
 
 
-def _export_audits(
-    clean_df: pd.DataFrame,
-    noisy_df: pd.DataFrame,
-    rental_unknown_df: pd.DataFrame,
+def _sample_parquet_rows(path: Path, n_target: int, columns: list[str], seed: int) -> pd.DataFrame:
+    if not path.exists() or n_target <= 0:
+        return pd.DataFrame()
+    pf = pq.ParquetFile(path)
+    total = pf.metadata.num_rows
+    if total == 0:
+        return pd.DataFrame()
+    avail_cols = [c for c in columns if c in pf.schema.names]
+    frac = min(1.0, (n_target * 2.5) / max(1, total))
+    rng = np.random.default_rng(seed)
+    parts = []
+    for batch in pf.iter_batches(batch_size=50_000, columns=avail_cols):
+        bdf = batch.to_pandas()
+        if frac < 1.0:
+            keep = rng.random(len(bdf)) < frac
+            bdf = bdf[keep]
+        if len(bdf) > 0:
+            parts.append(bdf)
+    if not parts:
+        # fallback first batch
+        first = next(pf.iter_batches(batch_size=min(n_target, total), columns=avail_cols)).to_pandas()
+        return first.head(n_target)
+    df = pd.concat(parts, axis=0, ignore_index=True)
+    if len(df) > n_target:
+        df = df.sample(n=n_target, random_state=seed).reset_index(drop=True)
+    return df
+
+
+def _export_audits_from_disk(
+    clean_path: Path,
+    noisy_path: Path,
+    rental_path: Path,
     audits_dir: Path,
     label_n: int,
     mask_n: int,
     seed: int,
 ) -> dict[str, Any]:
     audits_dir.mkdir(parents=True, exist_ok=True)
-    # Stratified label audit across clean + noisy + rental_unknown
+    lbl_cols = [
+        "row_id", "property_type_name", "province_norm", "district_norm",
+        "price", "area", "tx_type", "label_bucket", "text_status",
+        "text_price_vnd", "text_area_m2", "name_norm", "description_norm",
+    ]
     pool_parts = []
-    for name, frame in [("clean", clean_df), ("noisy", noisy_df), ("rental_unknown", rental_unknown_df)]:
-        if len(frame) > 0:
-            cols = [
-                "row_id",
-                "property_type_name",
-                "province_norm",
-                "district_norm",
-                "price",
-                "area",
-                "tx_type",
-                "label_bucket",
-                "text_status",
-                "text_price_vnd",
-                "text_area_m2",
-                "name_norm",
-                "description_norm",
-            ]
-            sub = frame[[c for c in cols if c in frame.columns]].copy()
+    for name, p in [("clean", clean_path), ("noisy", noisy_path), ("rental_unknown", rental_path)]:
+        sub = _sample_parquet_rows(p, n_target=max(label_n, 200), columns=lbl_cols, seed=seed)
+        if len(sub) > 0:
             sub["source_pool"] = name
             pool_parts.append(sub)
 
@@ -233,16 +291,19 @@ def _export_audits(
     sample_lbl["human_notes"] = ""
     sample_lbl.to_csv(audits_dir / "audit_labels_300.csv", index=False, encoding="utf-8-sig")
 
-    # Masking audit on clean samples
-    n_msk = min(mask_n, len(clean_df))
-    sample_msk = clean_df.sample(n=n_msk, random_state=seed).reset_index(drop=True) if n_msk > 0 else clean_df.head(0)
-    leaks = [find_leaked_money(t) for t in sample_msk["text_masked"]]
+    sample_msk = _sample_parquet_rows(
+        clean_path,
+        n_target=mask_n,
+        columns=["row_id", "property_type_name", "name_masked", "description_masked", "text_masked"],
+        seed=seed,
+    )
+    leaks = [find_leaked_money(t) for t in sample_msk["text_masked"]] if len(sample_msk) > 0 else []
     mask_audit_df = pd.DataFrame(
         {
-            "row_id": sample_msk["row_id"],
-            "property_type_name": sample_msk["property_type_name"],
-            "name_masked_redacted": [redact_pii(t) for t in sample_msk["name_masked"]],
-            "description_masked_redacted": [redact_pii(t)[:500] for t in sample_msk["description_masked"]],
+            "row_id": sample_msk["row_id"] if len(sample_msk) else [],
+            "property_type_name": sample_msk["property_type_name"] if len(sample_msk) else [],
+            "name_masked_redacted": [redact_pii(t) for t in sample_msk["name_masked"]] if len(sample_msk) else [],
+            "description_masked_redacted": [redact_pii(t)[:500] for t in sample_msk["description_masked"]] if len(sample_msk) else [],
             "leaked_tokens": ["; ".join(lk) for lk in leaks],
             "leaked_count": [len(lk) for lk in leaks],
             "human_no_leak_ok": "",
@@ -253,14 +314,14 @@ def _export_audits(
     return {
         "label_audit_rows": len(sample_lbl),
         "mask_audit_rows": len(mask_audit_df),
-        "mask_audit_leaks_detected": int((mask_audit_df["leaked_count"] > 0).sum()),
+        "mask_audit_leaks_detected": int((mask_audit_df["leaked_count"] > 0).sum()) if len(mask_audit_df) else 0,
     }
 
 
 def _write_data_reports(
     reports_dir: Path,
     summary: dict[str, Any],
-    clean_df: pd.DataFrame,
+    clean_meta_df: pd.DataFrame,
     diag_a: list[dict[str, Any]],
 ) -> None:
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -290,22 +351,22 @@ def _write_data_reports(
         "| Tháng | Số mẫu sạch |",
         "|---|---:|",
     ]
-    for m, cnt in clean_df["month"].value_counts().sort_index().items():
+    for m, cnt in clean_meta_df["month"].value_counts().sort_index().items():
         lines.append(f"| {m} | {cnt:,} |")
 
     lines.extend(["", "### Theo loại hình (`property_type_name`)", "| Loại hình | Số mẫu sạch | Tỷ lệ (%) |", "|---|---:|---:|"])
-    for ptype, cnt in clean_df["property_type_name"].value_counts().items():
-        lines.append(f"| {ptype} | {cnt:,} | {100*cnt/max(1,len(clean_df)):.2f}% |")
+    for ptype, cnt in clean_meta_df["property_type_name"].value_counts().items():
+        lines.append(f"| {ptype} | {cnt:,} | {100*cnt/max(1,len(clean_meta_df)):.2f}% |")
 
     lines.extend(["", "### Top 10 Tỉnh/Thành (tập sạch)", "| Tỉnh/Thành | Số mẫu sạch | Tỷ lệ (%) |", "|---|---:|---:|"])
-    for prov, cnt in clean_df["province_norm"].value_counts().head(10).items():
-        lines.append(f"| {prov} | {cnt:,} | {100*cnt/max(1,len(clean_df)):.2f}% |")
+    for prov, cnt in clean_meta_df["province_norm"].value_counts().head(10).items():
+        lines.append(f"| {prov} | {cnt:,} | {100*cnt/max(1,len(clean_meta_df)):.2f}% |")
 
     lines.extend(
         [
             "",
             "## 3. Khử trùng & Splits",
-            f"- Số nhóm trùng duy nhất trên `clean`: **{summary['dedup']['unique_groups']:,}** / {len(clean_df):,} dòng.",
+            f"- Số nhóm trùng duy nhất trên `clean`: **{summary['dedup']['unique_groups']:,}** / {len(clean_meta_df):,} dòng.",
             f"- Nhóm trùng có thay đổi giá giữa các lần đăng lại: **{summary['dedup']['groups_with_price_change']:,}**.",
             f"- Kịch bản A (mẫu cuối sau budget): {summary['splits']['scenario_a_counts']}",
             f"- Kịch bản B (mẫu cuối sau budget): {summary['splits']['scenario_b_counts']}",
@@ -384,9 +445,14 @@ def run_prepare_data(
 
     loc_norm = LocationNormalizer(paths["aliases_path"])
 
-    clean_parts: list[pd.DataFrame] = []
-    noisy_parts: list[pd.DataFrame] = []
-    rental_parts: list[pd.DataFrame] = []
+    clean_path = paths["processed_dir"] / "clean.parquet"
+    noisy_path = paths["processed_dir"] / "noisy_flagged.parquet"
+    rental_path = paths["processed_dir"] / "rental_unknown.parquet"
+
+    clean_writer = _ParquetStreamWriter(clean_path)
+    noisy_writer = _ParquetStreamWriter(noisy_path)
+    rental_writer = _ParquetStreamWriter(rental_path)
+
     funnel = {
         "total_raw": 0,
         "clean": 0,
@@ -407,60 +473,71 @@ def run_prepare_data(
             row_offset += len(bdf)
             for k, v in cnts.items():
                 funnel[k] += v
-            if len(c_df) > 0:
-                clean_parts.append(c_df)
-            if len(n_df) > 0:
-                noisy_parts.append(n_df)
-            if len(r_df) > 0:
-                # Keep compact subset of rental/unknown columns to control RAM/disk
-                keep_r = [
-                    c for c in [
-                        "row_id", "property_type_name", "province_norm", "district_norm",
-                        "price", "area", "published_at", "tx_type", "label_bucket", "text_status",
-                        "text_price_vnd", "text_area_m2", "name_norm", "description_norm",
-                    ] if c in r_df.columns
-                ]
-                rental_parts.append(r_df[keep_r])
+            clean_writer.write(c_df)
+            noisy_writer.write(n_df)
+            rental_writer.write(r_df)
+            del bdf, c_df, n_df, r_df
+        gc.collect()
 
-    clean_df = pd.concat(clean_parts, axis=0, ignore_index=True) if clean_parts else pd.DataFrame()
-    noisy_df = pd.concat(noisy_parts, axis=0, ignore_index=True) if noisy_parts else pd.DataFrame()
-    rental_df = pd.concat(rental_parts, axis=0, ignore_index=True) if rental_parts else pd.DataFrame()
+    clean_writer.close()
+    noisy_writer.close()
+    rental_writer.close()
 
-    # Deduplicate clean pool without using price
-    if len(clean_df) > 0:
-        clean_df["dup_group_id"] = assign_duplicate_groups(
-            clean_df,
+    # Pass 2: Read lightweight columns ONLY from clean.parquet for dedup & split creation
+    dedup_cols = [
+        "row_id",
+        "published_at",
+        "month",
+        "province_norm",
+        "district_norm",
+        "district_key",
+        "property_type_name",
+        "area",
+        "floor_count",
+        "bedroom_count",
+        "price",
+        "price_per_m2",
+        "y_true",
+        "text_masked",
+    ]
+    if clean_writer.rows_written > 0:
+        pf_clean = pq.ParquetFile(clean_path)
+        meta_parts = []
+        for batch in pf_clean.iter_batches(batch_size=100_000, columns=dedup_cols):
+            bdf = batch.to_pandas()
+            # Keep only leading 300 chars of text_masked in RAM for dedup
+            bdf["text_masked"] = bdf["text_masked"].astype(str).str.slice(0, 300)
+            meta_parts.append(bdf)
+        clean_meta = pd.concat(meta_parts, axis=0, ignore_index=True)
+        clean_meta["dup_group_id"] = assign_duplicate_groups(
+            clean_meta,
             threshold=float(cfg["dedup"]["minhash_threshold"]),
             num_perm=int(cfg["dedup"]["minhash_num_perm"]),
             ngram_size=int(cfg["dedup"]["ngram_size"]),
         )
+        clean_meta = clean_meta.drop(columns=["text_masked"])
     else:
-        clean_df["dup_group_id"] = pd.Series(dtype="object")
+        clean_meta = pd.DataFrame(columns=dedup_cols + ["dup_group_id"])
 
-    # Separate tracking for duplicate groups where price changed across reposts
-    grp_price_nunique = clean_df.groupby("dup_group_id")["price"].nunique() if len(clean_df) > 0 else pd.Series(dtype=int)
+    grp_price_nunique = clean_meta.groupby("dup_group_id")["price"].nunique() if len(clean_meta) > 0 else pd.Series(dtype=int)
     groups_with_price_change = int((grp_price_nunique > 1).sum())
 
-    clean_df.to_parquet(paths["processed_dir"] / "clean.parquet", index=False)
-    noisy_df.to_parquet(paths["processed_dir"] / "noisy_flagged.parquet", index=False)
-    rental_df.to_parquet(paths["processed_dir"] / "rental_unknown.parquet", index=False)
-
     # Build Scenario A & Scenario B manifests and apply stratified budgets
-    man_a_full = build_scenario_a_split(clean_df, cfg["splits"]["scenario_a"])
+    man_a_full = build_scenario_a_split(clean_meta, cfg["splits"]["scenario_a"])
     man_a = apply_stratified_budget(man_a_full, cfg["sampling"], seed=seed)
 
-    man_b_full = build_scenario_b_split(clean_df, cfg["splits"]["scenario_b"], seed=seed)
+    man_b_full = build_scenario_b_split(clean_meta, cfg["splits"]["scenario_b"], seed=seed)
     man_b = apply_stratified_budget(man_b_full, cfg["sampling"], seed=seed)
 
     man_a.to_parquet(splits_dir / "scenario_a_manifest.parquet", index=False)
     man_b.to_parquet(splits_dir / "scenario_b_manifest.parquet", index=False)
 
-    diag_a = _compute_train_ppm2_diagnostics(clean_df, man_a, cfg["cleaning"]["train_ppm2_quantiles"]) if len(man_a) > 0 else []
+    diag_a = _compute_train_ppm2_diagnostics(clean_meta, man_a, cfg["cleaning"]["train_ppm2_quantiles"]) if len(man_a) > 0 else []
 
-    audits_meta = _export_audits(
-        clean_df=clean_df,
-        noisy_df=noisy_df,
-        rental_unknown_df=rental_df,
+    audits_meta = _export_audits_from_disk(
+        clean_path=clean_path,
+        noisy_path=noisy_path,
+        rental_path=rental_path,
         audits_dir=audits_dir,
         label_n=int(cfg["audits"]["label_audit_size"]),
         mask_n=int(cfg["audits"]["mask_audit_size"]),
@@ -474,7 +551,7 @@ def run_prepare_data(
         "shards_processed": len(shard_paths),
         "funnel": funnel,
         "dedup": {
-            "unique_groups": int(clean_df["dup_group_id"].nunique()) if len(clean_df) > 0 else 0,
+            "unique_groups": int(clean_meta["dup_group_id"].nunique()) if len(clean_meta) > 0 else 0,
             "groups_with_price_change": groups_with_price_change,
         },
         "splits": {
@@ -487,7 +564,7 @@ def run_prepare_data(
         "audits": audits_meta,
     }
     (splits_dir / "split_manifest.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
-    _write_data_reports(paths["reports_dir"], summary, clean_df, diag_a)
+    _write_data_reports(paths["reports_dir"], summary, clean_meta, diag_a)
     return summary
 
 

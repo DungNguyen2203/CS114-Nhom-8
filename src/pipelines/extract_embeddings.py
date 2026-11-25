@@ -24,18 +24,24 @@ def run_extract_embeddings(cfg: dict[str, Any], paths: dict[str, Path]) -> dict[
     man_b = pd.read_parquet(splits_dir / "scenario_b_manifest.parquet", columns=["row_id"])
     union_ids = set(man_a["row_id"].astype(str)).union(set(man_b["row_id"].astype(str)))
 
-    clean_df = pd.read_parquet(
-        paths["processed_dir"] / "clean.parquet",
-        columns=[
-            "row_id",
-            "property_type_name",
-            "province_norm",
-            "district_norm",
-            "name_masked",
-            "description_masked",
-        ],
-    )
-    target_df = clean_df[clean_df["row_id"].astype(str).isin(union_ids)].copy()
+    import pyarrow.parquet as pq
+
+    needed_cols = [
+        "row_id",
+        "property_type_name",
+        "province_norm",
+        "district_norm",
+        "name_masked",
+        "description_masked",
+    ]
+    parts = []
+    pf = pq.ParquetFile(paths["processed_dir"] / "clean.parquet")
+    for batch in pf.iter_batches(batch_size=100_000, columns=needed_cols):
+        bdf = batch.to_pandas()
+        sub = bdf[bdf["row_id"].astype(str).isin(union_ids)]
+        if len(sub) > 0:
+            parts.append(sub)
+    target_df = pd.concat(parts, axis=0, ignore_index=True) if parts else pd.DataFrame(columns=needed_cols)
     target_df = target_df.sort_values("row_id").reset_index(drop=True)
 
     ph_cfg = cfg["phobert"]

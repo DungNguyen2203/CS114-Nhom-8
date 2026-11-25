@@ -62,7 +62,7 @@ def assign_duplicate_groups(
         return pd.Series([], index=df.index, dtype="object")
 
     text_col = "text_masked" if "text_masked" in df.columns else "name_masked"
-    texts = [_norm_dedup_text(str(t or "")) for t in df[text_col]]
+    texts = [_norm_dedup_text(str(t or "")[:300]) for t in df[text_col]]
     provs = df["province_norm"].fillna("__MISSING__").astype(str).tolist()
     dists = df["district_norm"].fillna("__MISSING__").astype(str).tolist()
     ptypes = df["property_type_name"].fillna("__MISSING__").astype(str).tolist()
