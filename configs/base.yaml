@@ -1,0 +1,106 @@
+project:
+  name: vn-realestate-valuation
+  rules_version: v1.0.0
+  seeds: [42, 17, 2026]
+  primary_seed: 42
+  text_version: v1.0.0
+  mask_token: MASK_GIA
+
+dataset:
+  repo_id: tinixai/vietnam-real-estates
+  revision: ca3fedcbb089bf65f7e4cfb03316cce4bd0d779f
+  expected_shards: 10
+  property_types:
+    - "Nhà"
+    - "Đất"
+    - "Căn hộ chung cư"
+    - "Biệt thự/Nhà liền kề"
+    - "Shophouse"
+
+paths:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  models_dir: models
+  outputs_dir: outputs
+  reports_dir: reports
+  aliases_path: configs/location_aliases_v1.yaml
+
+cleaning:
+  min_area_m2: 5.0
+  max_area_m2: 50000.0
+  min_price_vnd: 50000000.0
+  max_price_vnd: 2000000000000.0
+  min_price_per_m2_vnd: 500000.0
+  max_price_per_m2_vnd: 3000000000.0
+  price_mismatch_ratio_strict: 1.35
+  price_mismatch_ratio_approx: 1.60
+  order_of_magnitude_ratio: 5.0
+  area_mismatch_ratio: 1.30
+  tabular_bounds:
+    frontage_width: [1.0, 100.0]
+    house_depth: [1.0, 200.0]
+    road_width: [0.5, 100.0]
+    floor_count: [1.0, 60.0]
+    bedroom_count: [1.0, 50.0]
+    bathroom_count: [1.0, 50.0]
+  train_ppm2_quantiles: [0.005, 0.995]
+
+dedup:
+  minhash_num_perm: 64
+  minhash_threshold: 0.85
+  ngram_size: 3
+
+splits:
+  scenario_a:
+    train_months: ["2025-06", "2025-07", "2025-08", "2025-09", "2025-10"]
+    val_months: ["2025-11", "2025-12"]
+    cal_months: ["2026-01", "2026-02"]
+    test_months: ["2026-03"]
+    stale_cal_months: ["2025-09", "2025-10"]
+  scenario_b:
+    ratios: [0.70, 0.10, 0.10, 0.10]
+    min_group_rows: 1
+
+features:
+  rare_category_min_freq: 15
+  tfidf_max_features: 100000
+  tfidf_min_df: 5
+  svd_components_candidates: [64, 128]
+  pca_components_candidates: [64, 128]
+
+phobert:
+  model_name: vinai/phobert-base
+  revision: 01daacda68afe13d83023d16ec647239e344a1e6
+  max_length: 256
+  batch_size: 16
+  fp16: true
+  normalize_l2: true
+  chunk_pooling: false
+
+models:
+  m0_min_group_samples: 30
+  catboost:
+    iterations: 2000
+    early_stopping_rounds: 100
+    loss_candidates: ["RMSE", "MAE"]
+    depth_candidates: [6, 8]
+    lr_candidates: [0.05, 0.1]
+    quantiles: [0.05, 0.95]
+  ridge_alphas: [1.0, 10.0, 100.0]
+  m6_finetune:
+    enabled: false
+    lr: 1.5e-5
+    epochs: 2
+    batch_size: 16
+
+conformal:
+  alpha_primary: 0.10
+  alpha_secondary: 0.20
+  c3_min_group_samples: 500
+  min_eval_group_size: 500
+
+audits:
+  label_audit_size: 300
+  mask_audit_size: 100
+  flag_audit_size_per_class: 300
+  error_bucket_samples: 15

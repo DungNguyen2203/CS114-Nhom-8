@@ -1,0 +1,24 @@
+inherits: base.yaml
+
+runtime:
+  profile_name: local_smoke
+  hf_home: E:/hf_cache
+  device: auto
+
+sampling:
+  max_shards: 10
+  train_max_rows: 30000
+  val_max_rows: 6000
+  cal_max_rows: 6000
+  test_max_rows: 6000
+
+phobert:
+  batch_size: 16
+  fp16: true
+
+models:
+  catboost:
+    iterations: 1200
+    early_stopping_rounds: 80
+  m6_finetune:
+    enabled: false

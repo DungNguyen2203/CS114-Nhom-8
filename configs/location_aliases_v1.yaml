@@ -1,0 +1,38 @@
+version: v1.0.0
+
+province_aliases:
+  "tp hcm": "Hồ Chí Minh"
+  "tp. hcm": "Hồ Chí Minh"
+  "tp.hcm": "Hồ Chí Minh"
+  "tphcm": "Hồ Chí Minh"
+  "ho chi minh": "Hồ Chí Minh"
+  "sài gòn": "Hồ Chí Minh"
+  "hà nội": "Hà Nội"
+  "tp hà nội": "Hà Nội"
+  "đà nẵng": "Đà Nẵng"
+  "tp đà nẵng": "Đà Nẵng"
+  "hải phòng": "Hải Phòng"
+  "cần thơ": "Cần Thơ"
+  "thừa thiên huế": "Huế"
+  "huế": "Huế"
+  "bà rịa vũng tàu": "Bà Rịa - Vũng Tàu"
+  "bà rịa - vũng tàu": "Bà Rịa - Vũng Tàu"
+
+post_2025_07_merged_cues:
+  "Bình Dương": ["tp hcm", "tp.hcm", "hồ chí minh", "tphcm"]
+  "Bà Rịa - Vũng Tàu": ["tp hcm", "tp.hcm", "hồ chí minh", "tphcm"]
+  "Long An": ["tây ninh"]
+
+direction_aliases:
+  "đông": "Đông"
+  "tây": "Tây"
+  "nam": "Nam"
+  "bắc": "Bắc"
+  "đông bắc": "Đông Bắc"
+  "đông - bắc": "Đông Bắc"
+  "đông nam": "Đông Nam"
+  "đông - nam": "Đông Nam"
+  "tây bắc": "Tây Bắc"
+  "tây - bắc": "Tây Bắc"
+  "tây nam": "Tây Nam"
+  "tây - nam": "Tây Nam"

@@ -1,0 +1,21 @@
+inherits: base.yaml
+
+runtime:
+  profile_name: kaggle_full
+  hf_home: /kaggle/working/hf_cache
+  device: auto
+
+sampling:
+  max_shards: 10
+  train_max_rows: 100000
+  val_max_rows: 25000
+  cal_max_rows: 25000
+  test_max_rows: 25000
+
+phobert:
+  batch_size: 64
+  fp16: true
+
+models:
+  m6_finetune:
+    enabled: false
