@@ -9,10 +9,10 @@ __pycache__/
 .ruff_cache/
 
 # Heavy data, caches, models & outputs (generated locally or on Kaggle)
-data/raw/
-data/processed/
-models/
-outputs/
+/data/raw/
+/data/processed/
+/models/
+/outputs/
 *.parquet
 *.npy
 *.npz
@@ -21,7 +21,7 @@ outputs/
 *.pkl
 
 # Superpowers scratch / ledger
-.superpowers/
+/.superpowers/
 
 # OS & IDE
 .DS_Store
