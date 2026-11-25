@@ -75,11 +75,13 @@ def generate_all_figures(outputs_dir: Path, splits_dir: Path) -> list[Path]:
     if e3_path.exists():
         e3 = pd.read_csv(e3_path)
         if len(e3) > 0:
-            fig, ax = plt.subplots(figsize=(7.5, 4.2))
+            fig, ax = plt.subplots(figsize=(10.5, 4.8))
             sns.barplot(data=e3, x="variant", y="MAE_log", color="#dd6b20", ax=ax)
             ax.set_title("E3: Đối chứng rò rỉ giá & đóng góp mô tả (Scenario A Test)")
             ax.set_ylabel("MAE_log")
-            ax.tick_params(axis="x", rotation=15)
+            ax.tick_params(axis="x", rotation=22)
+            for tick in ax.get_xticklabels():
+                tick.set_horizontalalignment("right")
             fig.tight_layout()
             p3 = figs_dir / "fig_03_e3_leakage_ablation.png"
             fig.savefig(p3, dpi=160)

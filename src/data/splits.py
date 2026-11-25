@@ -135,6 +135,45 @@ def build_scenario_b_split(df: pd.DataFrame, split_cfg: dict[str, Any], seed: in
     return work[[c for c in cols if c in work.columns]].reset_index(drop=True)
 
 
+def stratified_sample_df(
+    df: pd.DataFrame,
+    group_cols: str | list[str],
+    n_total: int,
+    seed: int = 42,
+    id_col: str | None = "row_id",
+) -> pd.DataFrame:
+    """Proportionally sample up to n_total rows across strata while preserving all columns."""
+    if n_total <= 0 or len(df) == 0:
+        return df.iloc[0:0].copy()
+    if len(df) <= n_total:
+        return df.reset_index(drop=True).copy()
+
+    cols = [group_cols] if isinstance(group_cols, str) else list(group_cols)
+    frac = n_total / len(df)
+    parts: list[pd.DataFrame] = []
+    for _, grp in df.groupby(cols, dropna=False, sort=False):
+        target = min(len(grp), max(1, int(round(len(grp) * frac))))
+        if len(grp) <= 1 or target >= len(grp):
+            parts.append(grp)
+        else:
+            parts.append(grp.sample(n=target, random_state=seed))
+
+    sampled = pd.concat(parts, axis=0)
+    if len(sampled) > n_total:
+        sampled = sampled.sample(n=n_total, random_state=seed)
+    elif len(sampled) < n_total:
+        if id_col and id_col in df.columns and df[id_col].is_unique:
+            rem = df[~df[id_col].isin(sampled[id_col])]
+        else:
+            rem = df.loc[~df.index.isin(sampled.index)]
+        if len(rem) > 0:
+            sampled = pd.concat(
+                [sampled, rem.sample(n=min(len(rem), n_total - len(sampled)), random_state=seed)],
+                axis=0,
+            )
+    return sampled.reset_index(drop=True)
+
+
 def apply_stratified_budget(
     manifest_df: pd.DataFrame,
     sampling_cfg: dict[str, Any],
@@ -167,18 +206,13 @@ def apply_stratified_budget(
             + "|"
             + sub["month"].astype(str)
         )
-        frac = max_rows / len(sub)
-        sampled = (
-            sub.assign(_strata=strata_key)
-            .groupby("_strata", group_keys=False)
-            .apply(lambda g: g.sample(n=max(1, int(round(len(g) * frac))), random_state=seed) if len(g) > 1 else g)
+        sampled = stratified_sample_df(
+            sub.assign(_strata=strata_key),
+            "_strata",
+            n_total=max_rows,
+            seed=seed,
+            id_col="row_id",
         )
-        if len(sampled) > max_rows:
-            sampled = sampled.sample(n=max_rows, random_state=seed)
-        elif len(sampled) < max_rows:
-            remaining = sub.loc[~sub.index.isin(sampled.index)]
-            top_up = remaining.sample(n=min(len(remaining), max_rows - len(sampled)), random_state=seed)
-            sampled = pd.concat([sampled, top_up], axis=0)
         if "_strata" in sampled.columns:
             sampled = sampled.drop(columns=["_strata"])
         parts.append(sampled)

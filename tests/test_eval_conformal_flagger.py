@@ -5,7 +5,7 @@ import pytest
 from src.eval.leakage_checks import verify_split_leakage
 from src.eval.metrics import compute_point_metrics, compute_interval_metrics, evaluate_predictions_df
 from src.eval.conformal import fit_apply_conformal
-from src.eval.flagger import flag_mispriced_listings
+from src.eval.flagger import export_flag_audit_samples, flag_mispriced_listings
 from src.eval.error_analysis import sample_error_buckets, analyze_residual_keywords
 
 
@@ -124,3 +124,43 @@ def test_flagger_and_error_analysis():
 
     corr = analyze_residual_keywords(eval_df, eval_df)
     assert "bán gấp" in set(corr["keyword"])
+
+
+def test_export_flag_audit_samples_preserves_columns_pandas3(tmp_path):
+    eval_df = pd.DataFrame(
+        {
+            "row_id": ["00_1", "00_2", "00_3", "00_4"],
+            "y_true": [21.0, 23.0, 25.0, 22.8],
+            "y_pred": [23.0, 23.05, 22.0, 22.9],
+            "q_lo": [22.5, 22.5, 21.5, 22.3],
+            "q_hi": [23.5, 23.5, 22.5, 23.4],
+            "text_status": ["clean_consistent", "clean_consistent", "noisy_order_of_magnitude", "clean_consistent"],
+            "area_mismatch_flag": [False, False, True, False],
+        }
+    )
+    meta_df = pd.DataFrame(
+        {
+            "row_id": ["00_1", "00_2", "00_3", "00_4"],
+            "property_type_name": ["Nhà", "Nhà", "Đất", "Căn hộ chung cư"],
+            "province_norm": ["Hà Nội", "Hà Nội", "Hồ Chí Minh", "Đà Nẵng"],
+            "district_norm": ["Cầu Giấy", "Đống Đa", "Quận 1", "Hải Châu"],
+            "area": [50.0, 60.0, 100.0, 70.0],
+            "price": [1.3e9, 9.7e9, 7.2e10, 8.0e9],
+            "text_price_vnd": [1.3e9, 9.7e9, 7.2e9, 8.0e9],
+            "text_status": ["clean_consistent", "clean_consistent", "noisy_order_of_magnitude", "clean_consistent"],
+            "area_mismatch_flag": [False, False, True, False],
+            "name_norm": ["Tin 1", "Tin 2", "Tin 3", "Tin 4"],
+            "description_norm": ["Desc 1", "Desc 2", "Desc 3", "Desc 4"],
+        }
+    )
+    flagged = flag_mispriced_listings(eval_df)
+    out_csv = tmp_path / "audit_flags.csv"
+    stats = export_flag_audit_samples(flagged, meta_df, noisy_df=None, out_path=out_csv, n_per_class=2, seed=42)
+    assert out_csv.exists()
+    assert stats["n_flagged_exported"] == 2
+    assert stats["n_unflagged_exported"] == 2
+    assert len(stats["subtype_counts"]) >= 1
+    df_out = pd.read_csv(out_csv)
+    assert df_out["audit_subtype"].notna().all()
+    assert df_out["property_type_name"].notna().all()
+

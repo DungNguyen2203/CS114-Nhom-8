@@ -311,6 +311,10 @@ def test_run_prepare_data_end_to_end_synthetic(tmp_path):
     assert man_a["dup_group_id"].is_unique
     assert "01_0000000" not in set(man_a["row_id"])  # duplicate from val month dropped
 
+    lbl_audit = pd.read_csv(paths["outputs_dir"] / "audits" / "audit_labels_300.csv")
+    assert lbl_audit["property_type_name"].notna().all()
+    assert lbl_audit["label_bucket"].notna().all()
+
     mask_audit = pd.read_csv(paths["outputs_dir"] / "audits" / "audit_masking_100.csv")
     assert (mask_audit["leaked_count"] == 0).all()
     assert summary["funnel"]["total_raw"] == 13

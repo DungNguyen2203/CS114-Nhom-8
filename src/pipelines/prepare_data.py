@@ -21,7 +21,7 @@ from src.data.dedup import assign_duplicate_groups
 from src.data.download import download_dataset_shards
 from src.data.location_normalizer import LocationNormalizer
 from src.data.price_area_parser import parse_listing_text, reconcile_labels
-from src.data.splits import apply_stratified_budget, build_scenario_a_split, build_scenario_b_split
+from src.data.splits import apply_stratified_budget, build_scenario_a_split, build_scenario_b_split, stratified_sample_df
 from src.data.tabular_cleaner import clean_tabular_domain
 from src.data.text_masker import find_leaked_money, mask_money_text
 from src.data.text_normalizer import normalize_text, redact_pii
@@ -344,19 +344,13 @@ def _export_audits_from_disk(
 
     all_pool = pd.concat(pool_parts, axis=0, ignore_index=True)
     n_lbl = min(label_n, len(all_pool))
-    sample_lbl = (
-        all_pool.groupby(["property_type_name", "label_bucket"], group_keys=False)
-        .apply(lambda g: g.sample(n=max(1, int(round(len(g) / len(all_pool) * n_lbl))), random_state=seed))
-        .head(n_lbl)
-        .reset_index(drop=True)
+    sample_lbl = stratified_sample_df(
+        all_pool,
+        ["property_type_name", "label_bucket"],
+        n_total=n_lbl,
+        seed=seed,
+        id_col="row_id",
     )
-    if len(sample_lbl) < n_lbl:
-        rem = all_pool[~all_pool["row_id"].isin(sample_lbl["row_id"])]
-        sample_lbl = pd.concat(
-            [sample_lbl, rem.sample(n=min(len(rem), n_lbl - len(sample_lbl)), random_state=seed)],
-            axis=0,
-            ignore_index=True,
-        )
 
     sample_lbl["name_redacted"] = [redact_pii(v) for v in sample_lbl["name_norm"]]
     sample_lbl["description_redacted"] = [redact_pii(v)[:500] for v in sample_lbl["description_norm"]]

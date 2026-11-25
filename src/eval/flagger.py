@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from src.data.splits import stratified_sample_df
 from src.data.text_normalizer import redact_pii
 
 
@@ -86,15 +87,13 @@ def export_flag_audit_samples(
     )
     n_flag = min(n_per_class, len(flagged_pool))
     if n_flag > 0:
-        flag_sample = (
-            flagged_pool.groupby("audit_subtype", group_keys=False)
-            .apply(lambda g: g.sample(n=max(1, int(round(len(g) / len(flagged_pool) * n_flag))), random_state=seed))
-            .head(n_flag)
-            .reset_index(drop=True)
+        flag_sample = stratified_sample_df(
+            flagged_pool,
+            "audit_subtype",
+            n_total=n_flag,
+            seed=seed,
+            id_col="row_id",
         )
-        if len(flag_sample) < n_flag:
-            rem = flagged_pool[~flagged_pool["row_id"].isin(flag_sample["row_id"])]
-            flag_sample = pd.concat([flag_sample, rem.sample(n=min(len(rem), n_flag - len(flag_sample)), random_state=seed)], ignore_index=True)
     else:
         flag_sample = flagged_pool.head(0)
 

@@ -126,6 +126,7 @@ def _run_scenario_a(
         return p_df
 
     # --- M0 ---
+    print(f"[Scenario A] Training M0/M1/M2/M3/M4/M5 (train={len(tr):,}, val={len(va):,}, cal={len(ca):,}, test={len(te):,})...", flush=True)
     t0 = time.perf_counter()
     m0 = M0GroupMedianModel(min_group_samples=int(cfg["models"]["m0_min_group_samples"])).fit(tr)
     t_m0 = time.perf_counter() - t0
@@ -138,6 +139,7 @@ def _run_scenario_a(
             pred_dfs_test["M0"] = pdf
 
     # --- M1 (tune + multi-seed + quantiles) ---
+    print("[Scenario A] Tuning & training M1 (Tabular CatBoost)...", flush=True)
     m1 = M1CatBoostModel(
         iterations=int(cb_cfg["iterations"]),
         early_stopping_rounds=int(cb_cfg["early_stopping_rounds"]),
@@ -196,6 +198,7 @@ def _run_scenario_a(
             pred_dfs_test["M3"] = pdf
 
     # --- M4 (TF-IDF SVD + Tabular CatBoost) ---
+    print("[Scenario A] Tuning & training M2, M3, M4...", flush=True)
     best_svd_k = int(feat_cfg["svd_components_candidates"][0])
     best_m4_mae = float("inf")
     best_m4 = None
@@ -250,6 +253,7 @@ def _run_scenario_a(
                 pred_dfs_test["M4"] = pdf
 
     # --- M5 (PhoBERT PCA + Tabular CatBoost) ---
+    print("[Scenario A] Tuning & training M5 (PhoBERT + Tabular CatBoost)...", flush=True)
     best_pca_k = int(feat_cfg["pca_components_candidates"][0])
     best_m5_mae = float("inf")
     best_m5 = None
@@ -297,23 +301,15 @@ def _run_scenario_a(
 
     # Select winner strictly by Validation MAE_log
     winner_id = min(val_mae_by_model, key=lambda k: val_mae_by_model[k])
+    print(f"[Scenario A] Validation winner: {winner_id} ({val_mae_by_model}). Running E3 ablation...", flush=True)
 
-    # E3: Ablation & unmasked leakage control on Scenario A (title-only & unmasked control slice)
-    e3_rows = [
-        {"variant": "M1_tabular_only", "MAE_log": float(np.mean(np.abs(pred_dfs_test["M1"]["y_pred"] - y_te)))},
-        {"variant": "M5_masked_full", "MAE_log": float(np.mean(np.abs(pred_dfs_test["M5"]["y_pred"] - y_te)))},
+    # E3: Fair apple-to-apple ablation & unmasked leakage control on Scenario A
+    e3_rows: list[dict[str, Any]] = [
+        {"variant": "M1_tabular_only_full", "MAE_log": float(np.mean(np.abs(pred_dfs_test["M1"]["y_pred"] - y_te))), "n_train": len(tr), "n_test": len(te)},
+        {"variant": "M4_masked_full", "MAE_log": float(np.mean(np.abs(pred_dfs_test["M4"]["y_pred"] - y_te))), "n_train": len(tr), "n_test": len(te)},
+        {"variant": "M5_masked_full", "MAE_log": float(np.mean(np.abs(pred_dfs_test["M5"]["y_pred"] - y_te))), "n_train": len(tr), "n_test": len(te)},
     ]
-    # M5 title-only / no description
     ph_cfg = cfg["phobert"]
-    e3_embedder = PhoBERTEmbedder(
-        model_name=ph_cfg["model_name"],
-        revision=ph_cfg["revision"],
-        max_length=int(ph_cfg["max_length"]),
-        batch_size=int(ph_cfg["batch_size"]),
-        fp16=bool(ph_cfg["fp16"]),
-        normalize_l2=bool(ph_cfg["normalize_l2"]),
-        device=cfg.get("runtime", {}).get("device", "auto"),
-    )
     e3_tr_n = min(len(tr), 5000)
     e3_va_n = min(len(va), 1500)
     e3_te_n = min(len(te), 1500)
@@ -322,22 +318,60 @@ def _run_scenario_a(
         va_e3 = va.iloc[:e3_va_n]
         te_e3 = te.iloc[:e3_te_n]
 
+        # Same-slice M1 tabular baseline
+        m1_e3 = M1CatBoostModel(iterations=int(cb_cfg["iterations"]), early_stopping_rounds=int(cb_cfg["early_stopping_rounds"]))
+        m1_e3.fit_with_config(X_tr_tab.iloc[:e3_tr_n], y_tr[:e3_tr_n], X_va_tab.iloc[:e3_va_n], y_va[:e3_va_n], cat_cols, m1_best_cfg, seed=primary_seed)
+        e3_rows.append({"variant": "M1_tabular_only_slice", "MAE_log": float(np.mean(np.abs(m1_e3.predict(X_te_tab.iloc[:e3_te_n]) - y_te[:e3_te_n]))), "n_train": e3_tr_n, "n_test": e3_te_n})
+
+        # Same-slice M4 masked vs unmasked control
+        m4_ext_m = TfidfSvdExtractor(max_features=int(feat_cfg["tfidf_max_features"]), min_df=int(feat_cfg["tfidf_min_df"]), ngram_range=(1, 2), svd_components=best_svd_k, seed=primary_seed)
+        _, svd_m_tr = m4_ext_m.fit_transform(tr_e3["text_masked"].tolist(), fit_svd=True)
+        svd_m_va = m4_ext_m.transform_svd(va_e3["text_masked"].tolist())
+        svd_m_te = m4_ext_m.transform_svd(te_e3["text_masked"].tolist())
+        m4_e3_m = M4TfidfCatBoostModel(iterations=int(cb_cfg["iterations"]), early_stopping_rounds=int(cb_cfg["early_stopping_rounds"]), depth=int(m1_best_cfg["depth"]), learning_rate=float(m1_best_cfg["learning_rate"]), loss_function=str(m1_best_cfg["loss_function"]))
+        m4_e3_m.fit(X_tr_tab.iloc[:e3_tr_n], svd_m_tr, y_tr[:e3_tr_n], X_va_tab.iloc[:e3_va_n], svd_m_va, y_va[:e3_va_n], cat_cols, seed=primary_seed)
+        e3_rows.append({"variant": "M4_masked_slice", "MAE_log": float(np.mean(np.abs(m4_e3_m.predict(X_te_tab.iloc[:e3_te_n], svd_m_te) - y_te[:e3_te_n]))), "n_train": e3_tr_n, "n_test": e3_te_n})
+
+        unmasked_tr_txt = [f"{a}. {b}" for a, b in zip(tr_e3["name_norm"], tr_e3["description_norm"])]
+        unmasked_va_txt = [f"{a}. {b}" for a, b in zip(va_e3["name_norm"], va_e3["description_norm"])]
+        unmasked_te_txt = [f"{a}. {b}" for a, b in zip(te_e3["name_norm"], te_e3["description_norm"])]
+
+        m4_ext_u = TfidfSvdExtractor(max_features=int(feat_cfg["tfidf_max_features"]), min_df=int(feat_cfg["tfidf_min_df"]), ngram_range=(1, 2), svd_components=best_svd_k, seed=primary_seed)
+        _, svd_u_tr = m4_ext_u.fit_transform(unmasked_tr_txt, fit_svd=True)
+        svd_u_va = m4_ext_u.transform_svd(unmasked_va_txt)
+        svd_u_te = m4_ext_u.transform_svd(unmasked_te_txt)
+        m4_e3_u = M4TfidfCatBoostModel(iterations=int(cb_cfg["iterations"]), early_stopping_rounds=int(cb_cfg["early_stopping_rounds"]), depth=int(m1_best_cfg["depth"]), learning_rate=float(m1_best_cfg["learning_rate"]), loss_function=str(m1_best_cfg["loss_function"]))
+        m4_e3_u.fit(X_tr_tab.iloc[:e3_tr_n], svd_u_tr, y_tr[:e3_tr_n], X_va_tab.iloc[:e3_va_n], svd_u_va, y_va[:e3_va_n], cat_cols, seed=primary_seed)
+        e3_rows.append({"variant": "M4_unmasked_leak_control_slice", "MAE_log": float(np.mean(np.abs(m4_e3_u.predict(X_te_tab.iloc[:e3_te_n], svd_u_te) - y_te[:e3_te_n]))), "n_train": e3_tr_n, "n_test": e3_te_n})
+
+        # Same-slice M5 masked (reuses pre-cached embeddings)
+        m5_e3_m = M5PhoBERTCatBoostModel(pca_components=best_pca_k, iterations=int(cb_cfg["iterations"]), early_stopping_rounds=int(cb_cfg["early_stopping_rounds"]), depth=int(m1_best_cfg["depth"]), learning_rate=float(m1_best_cfg["learning_rate"]), loss_function=str(m1_best_cfg["loss_function"]))
+        m5_e3_m.fit(X_tr_tab.iloc[:e3_tr_n], emb_tr[:e3_tr_n], y_tr[:e3_tr_n], X_va_tab.iloc[:e3_va_n], emb_va[:e3_va_n], y_va[:e3_va_n], cat_cols, seed=primary_seed)
+        e3_rows.append({"variant": "M5_masked_slice", "MAE_log": float(np.mean(np.abs(m5_e3_m.predict(X_te_tab.iloc[:e3_te_n], emb_te[:e3_te_n]) - y_te[:e3_te_n]))), "n_train": e3_tr_n, "n_test": e3_te_n})
+
+        # Same-slice M5 title-only & M5 unmasked leak control
+        e3_embedder = PhoBERTEmbedder(
+            model_name=ph_cfg["model_name"],
+            revision=ph_cfg["revision"],
+            max_length=int(ph_cfg["max_length"]),
+            batch_size=int(ph_cfg["batch_size"]),
+            fp16=bool(ph_cfg["fp16"]),
+            normalize_l2=bool(ph_cfg["normalize_l2"]),
+            device=cfg.get("runtime", {}).get("device", "auto"),
+        )
         emb_title_tr, _ = e3_embedder.embed_texts(tr_e3["name_masked"].tolist(), mask_token=cfg["project"]["mask_token"])
         emb_title_va, _ = e3_embedder.embed_texts(va_e3["name_masked"].tolist(), mask_token=cfg["project"]["mask_token"])
         emb_title_te, _ = e3_embedder.embed_texts(te_e3["name_masked"].tolist(), mask_token=cfg["project"]["mask_token"])
         m5_title = M5PhoBERTCatBoostModel(pca_components=best_pca_k, iterations=int(cb_cfg["iterations"]), early_stopping_rounds=int(cb_cfg["early_stopping_rounds"]), depth=int(m1_best_cfg["depth"]), learning_rate=float(m1_best_cfg["learning_rate"]), loss_function=str(m1_best_cfg["loss_function"]))
         m5_title.fit(X_tr_tab.iloc[:e3_tr_n], emb_title_tr, y_tr[:e3_tr_n], X_va_tab.iloc[:e3_va_n], emb_title_va, y_va[:e3_va_n], cat_cols, seed=primary_seed)
-        e3_rows.append({"variant": "M5_masked_title_only_slice", "MAE_log": float(np.mean(np.abs(m5_title.predict(X_te_tab.iloc[:e3_te_n], emb_title_te) - y_te[:e3_te_n])))})
+        e3_rows.append({"variant": "M5_masked_title_only_slice", "MAE_log": float(np.mean(np.abs(m5_title.predict(X_te_tab.iloc[:e3_te_n], emb_title_te) - y_te[:e3_te_n]))), "n_train": e3_tr_n, "n_test": e3_te_n})
 
-        unmasked_tr_txt = [f"{a}. {b}" for a, b in zip(tr_e3["name_norm"], tr_e3["description_norm"])]
-        unmasked_va_txt = [f"{a}. {b}" for a, b in zip(va_e3["name_norm"], va_e3["description_norm"])]
-        unmasked_te_txt = [f"{a}. {b}" for a, b in zip(te_e3["name_norm"], te_e3["description_norm"])]
         emb_unm_tr, _ = e3_embedder.embed_texts(unmasked_tr_txt, mask_token=cfg["project"]["mask_token"])
         emb_unm_va, _ = e3_embedder.embed_texts(unmasked_va_txt, mask_token=cfg["project"]["mask_token"])
         emb_unm_te, _ = e3_embedder.embed_texts(unmasked_te_txt, mask_token=cfg["project"]["mask_token"])
         m5_unm = M5PhoBERTCatBoostModel(pca_components=best_pca_k, iterations=int(cb_cfg["iterations"]), early_stopping_rounds=int(cb_cfg["early_stopping_rounds"]), depth=int(m1_best_cfg["depth"]), learning_rate=float(m1_best_cfg["learning_rate"]), loss_function=str(m1_best_cfg["loss_function"]))
         m5_unm.fit(X_tr_tab.iloc[:e3_tr_n], emb_unm_tr, y_tr[:e3_tr_n], X_va_tab.iloc[:e3_va_n], emb_unm_va, y_va[:e3_va_n], cat_cols, seed=primary_seed)
-        e3_rows.append({"variant": "M5_unmasked_leak_control_slice", "MAE_log": float(np.mean(np.abs(m5_unm.predict(X_te_tab.iloc[:e3_te_n], emb_unm_te) - y_te[:e3_te_n])))})
+        e3_rows.append({"variant": "M5_unmasked_leak_control_slice", "MAE_log": float(np.mean(np.abs(m5_unm.predict(X_te_tab.iloc[:e3_te_n], emb_unm_te) - y_te[:e3_te_n]))), "n_train": e3_tr_n, "n_test": e3_te_n})
 
     pd.DataFrame(e3_rows).to_csv(metrics_dir / "e3_ablation.csv", index=False)
 
@@ -420,6 +454,7 @@ def _run_scenario_a(
         conformal_rows.append({"scenario": "A", "model_id": "M1_stale_train", "alpha": alpha_pri, "method": "C2_stale_cal", **ev_stale["overall"]})
 
     # E6 Flagging, audit export & error analysis
+    print("[Scenario A] Running Conformal/Flagging/Audit export & saving bundle...", flush=True)
     assert c2_test_out is not None
     flagged_te = flag_mispriced_listings(c2_test_out)
     flag_audit_stats = export_flag_audit_samples(
@@ -535,6 +570,7 @@ def _run_scenario_b(
         return pdf
 
     # M0 on B
+    print(f"[Scenario B] Running temporal shift M0/M1/M5 + Conformal (train={len(tr):,}, test={len(te):,})...", flush=True)
     t0 = time.perf_counter()
     m0 = M0GroupMedianModel(min_group_samples=int(cfg["models"]["m0_min_group_samples"])).fit(tr)
     t_m0 = time.perf_counter() - t0
