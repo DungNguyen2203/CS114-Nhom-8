@@ -164,3 +164,29 @@ def test_export_flag_audit_samples_preserves_columns_pandas3(tmp_path):
     assert df_out["audit_subtype"].notna().all()
     assert df_out["property_type_name"].notna().all()
 
+
+def test_evaluate_predictions_df_preserves_subgroup_columns():
+    pred_df = pd.DataFrame(
+        {
+            "row_id": ["00_1", "00_2", "00_3"],
+            "y_true": [22.0, 22.5, 23.0],
+            "y_pred": [22.1, 22.4, 22.9],
+            "q_lo": [21.5, 21.9, 22.4],
+            "q_hi": [22.6, 22.9, 23.5],
+            "property_type_name": ["Nhà", "Đất", "Shophouse"],
+        }
+    )
+    meta_df = pd.DataFrame(
+        {
+            "row_id": ["00_1", "00_2", "00_3"],
+            "property_type_name": ["Nhà", "Đất", "Shophouse"],
+            "province_norm": ["Hà Nội", "Hồ Chí Minh", "Đà Nẵng"],
+            "district_key": ["HN|CG", "HCM|Q7", "DN|HC"],
+            "month": ["2026-03", "2026-03", "2026-03"],
+        }
+    )
+    res = evaluate_predictions_df(pred_df, meta_df, alpha=0.10, min_eval_group_size=1)
+    dims = set(res["subgroups"]["group_dim"].tolist())
+    assert "property_type_name" in dims
+    assert "region_bucket" in dims
+

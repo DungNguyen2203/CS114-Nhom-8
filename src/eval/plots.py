@@ -93,13 +93,19 @@ def generate_all_figures(outputs_dir: Path, splits_dir: Path) -> list[Path]:
     if conf_path.exists():
         cf = pd.read_csv(conf_path)
         if len(cf) > 0:
-            fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+            fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.8))
             sns.barplot(data=cf, x="method", y="coverage", hue="scenario", ax=axes[0])
             axes[0].axhline(0.90, color="red", linestyle="--", label="Mục tiêu 90%")
             axes[0].set_ylim(0, 1.05)
             axes[0].set_title("Độ phủ thực tế (Conformal C0–C3 & Stale Cal)")
+            axes[0].tick_params(axis="x", rotation=20)
+            for tick in axes[0].get_xticklabels():
+                tick.set_horizontalalignment("right")
             sns.barplot(data=cf, x="method", y="mean_width_log", hue="scenario", ax=axes[1])
             axes[1].set_title("Độ rộng trung bình trên thang log")
+            axes[1].tick_params(axis="x", rotation=20)
+            for tick in axes[1].get_xticklabels():
+                tick.set_horizontalalignment("right")
             fig.tight_layout()
             p4 = figs_dir / "fig_04_conformal_methods.png"
             fig.savefig(p4, dpi=160)

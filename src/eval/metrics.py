@@ -79,9 +79,9 @@ def evaluate_predictions_df(
     """Compute overall and subgroup metrics from standardized prediction DataFrame."""
     meta_cols = [
         c for c in ["row_id", "property_type_name", "province_norm", "district_key", "month"]
-        if c in meta_df.columns
+        if c in meta_df.columns and (c == "row_id" or c not in pred_df.columns)
     ]
-    merged = pred_df.merge(meta_df[meta_cols].drop_duplicates("row_id"), on="row_id", how="left")
+    merged = pred_df.merge(meta_df[meta_cols].drop_duplicates("row_id"), on="row_id", how="left") if len(meta_cols) > 1 else pred_df.copy()
 
     overall = compute_point_metrics(merged["y_true"].to_numpy(), merged["y_pred"].to_numpy())
     has_intervals = ("q_lo" in merged.columns) and ("q_hi" in merged.columns) and merged["q_lo"].notna().all() and merged["q_hi"].notna().all()
