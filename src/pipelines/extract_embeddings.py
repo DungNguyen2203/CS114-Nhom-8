@@ -43,6 +43,7 @@ def run_extract_embeddings(cfg: dict[str, Any], paths: dict[str, Path]) -> dict[
             parts.append(sub)
     target_df = pd.concat(parts, axis=0, ignore_index=True) if parts else pd.DataFrame(columns=needed_cols)
     target_df = target_df.sort_values("row_id").reset_index(drop=True)
+    print(f"[TV3] Extracting PhoBERT embeddings for {len(target_df):,} unique union rows...", flush=True)
 
     ph_cfg = cfg["phobert"]
     embedder = PhoBERTEmbedder(
