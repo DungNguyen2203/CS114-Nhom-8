@@ -47,12 +47,58 @@ def _slice_by_split(clean_df: pd.DataFrame, man_df: pd.DataFrame) -> dict[str, p
     }
 
 
-def _measure_latency(predict_fn, n_rows: int) -> dict[str, float]:
+# Only models with quantile heads can produce conformal intervals and a deployable bundle.
+_CONFORMAL_CAPABLE = ("M1", "M4", "M5")
+
+
+def _pick_conformal_model(val_mae_by_model: dict[str, float]) -> str:
+    """Best validation-MAE model among those that have quantile heads (never silently M5)."""
+    cand = {k: v for k, v in val_mae_by_model.items() if k in _CONFORMAL_CAPABLE}
+    if not cand:
+        raise RuntimeError(f"No conformal-capable model (M1/M4/M5) in {sorted(val_mae_by_model)}")
+    return min(cand, key=lambda k: cand[k])
+
+
+def _measure_latency(predict_fn, n_rows: int) -> dict[str, Any]:
     t0 = time.perf_counter()
     _ = predict_fn()
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
     per_row_ms = elapsed_ms / max(1, n_rows)
     return {"batch_total_ms": elapsed_ms, "per_row_mean_ms": per_row_ms}
+
+
+_LISTING_COLS = {
+    "property_type_name": "property_type_name", "area": "area", "floor_count": "floor_count",
+    "frontage_width": "frontage_width", "house_depth": "house_depth", "road_width": "road_width",
+    "bedroom_count": "bedroom_count", "bathroom_count": "bathroom_count",
+    "province_name": "province_norm", "district_name": "district_norm", "ward_name": "ward_norm",
+    "street_name": "street_norm", "project_name": "project_norm",
+    "house_direction": "house_direction_norm", "balcony_direction": "balcony_direction_norm",
+    "name": "name_norm", "description": "description_norm",
+}
+
+
+def _measure_single_row_latency(bundle_dir: Path, te_df: pd.DataFrame, n_rows: int = 50, seed: int = 42) -> dict[str, float]:
+    """End-to-end latency (mask + features + model + conformal) via the demo service: median and p95 per listing."""
+    from app.inference import ValuationInferenceService
+
+    svc = ValuationInferenceService.load(bundle_dir)
+    rows = te_df.sample(n=min(n_rows, len(te_df)), random_state=seed)
+    listings = [
+        {k: (None if pd.isna(r[c]) else r[c]) for k, c in _LISTING_COLS.items() if c in rows.columns}
+        for _, r in rows.iterrows()
+    ]
+    svc.predict_single(listings[0])  # warm-up (lazy model loads)
+    times_ms = []
+    for lst in listings:
+        t0 = time.perf_counter()
+        svc.predict_single(lst)
+        times_ms.append((time.perf_counter() - t0) * 1000.0)
+    return {
+        "single_row_median_ms": float(np.median(times_ms)),
+        "single_row_p95_ms": float(np.percentile(times_ms, 95)),
+        "single_row_n": len(times_ms),
+    }
 
 
 def _run_scenario_a(
@@ -99,10 +145,10 @@ def _run_scenario_a(
     X_te_sp, X_te_svd = tfidf_ext.transform(te["text_masked"].tolist())
 
     # Load PhoBERT embeddings aligned strictly by row_id
-    emb_tr = load_embeddings_for_row_ids(tr["row_id"].tolist(), cache_dir)
-    emb_va = load_embeddings_for_row_ids(va["row_id"].tolist(), cache_dir)
-    emb_ca = load_embeddings_for_row_ids(ca["row_id"].tolist(), cache_dir)
-    emb_te = load_embeddings_for_row_ids(te["row_id"].tolist(), cache_dir)
+    emb_tr = load_embeddings_for_row_ids(tr["row_id"].tolist(), cache_dir, cfg["project"]["text_version"])
+    emb_va = load_embeddings_for_row_ids(va["row_id"].tolist(), cache_dir, cfg["project"]["text_version"])
+    emb_ca = load_embeddings_for_row_ids(ca["row_id"].tolist(), cache_dir, cfg["project"]["text_version"])
+    emb_te = load_embeddings_for_row_ids(te["row_id"].tolist(), cache_dir, cfg["project"]["text_version"])
 
     all_metrics: list[dict[str, Any]] = []
     tuning_logs: list[dict[str, Any]] = []
@@ -339,9 +385,14 @@ def _run_scenario_a(
             if sp_name == "test":
                 pred_dfs_test["M6"] = pdf
 
-    # Select winner strictly by Validation MAE_log
-    winner_id = min(val_mae_by_model, key=lambda k: val_mae_by_model[k])
-    print(f"[Scenario A] Validation winner: {winner_id} ({val_mae_by_model}). Running E3 ablation...", flush=True)
+    # Validation winner over ALL models (reported as-is), and the best model that has quantile heads
+    # (M1/M4/M5): only those can feed conformal intervals and the deployable bundle.
+    val_winner_id = min(val_mae_by_model, key=lambda k: val_mae_by_model[k])
+    winner_id = _pick_conformal_model(val_mae_by_model)
+    print(
+        f"[Scenario A] Validation winner: {val_winner_id}; conformal/bundle model: {winner_id} ({val_mae_by_model}). Running E3 ablation...",
+        flush=True,
+    )
 
     # E3: Fair apple-to-apple stratified ablation & unmasked leakage control on Scenario A
     e3_rows: list[dict[str, Any]] = [
@@ -381,6 +432,24 @@ def _run_scenario_a(
         unmasked_tr_txt = [f"{a}. {b}" for a, b in zip(tr_e3["name_norm"], tr_e3["description_norm"])]
         unmasked_va_txt = [f"{a}. {b}" for a, b in zip(va_e3["name_norm"], va_e3["description_norm"])]
         unmasked_te_txt = [f"{a}. {b}" for a, b in zip(te_e3["name_norm"], te_e3["description_norm"])]
+
+        # Sensitive leak control: full sparse TF-IDF + Ridge sees every token (SVD/PCA in M4/M5 compress away most price text).
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.linear_model import Ridge
+
+        def _sparse_ridge_mae(txt_tr: list[str], txt_te: list[str]) -> float:
+            vec = TfidfVectorizer(
+                ngram_range=(1, 2),
+                max_features=int(feat_cfg["tfidf_max_features"]),
+                min_df=int(feat_cfg["tfidf_min_df"]),
+                sublinear_tf=True,
+                dtype=np.float32,
+            )
+            rg = Ridge(alpha=1.0).fit(vec.fit_transform(txt_tr), y_tr[tr_pos])
+            return float(np.mean(np.abs(rg.predict(vec.transform(txt_te)) - y_te[te_pos])))
+
+        e3_rows.append({"variant": "M2sparse_masked_slice", "MAE_log": _sparse_ridge_mae(tr_e3["text_masked"].tolist(), te_e3["text_masked"].tolist()), "n_train": e3_tr_n, "n_test": e3_te_n})
+        e3_rows.append({"variant": "M2sparse_unmasked_leak_control_slice", "MAE_log": _sparse_ridge_mae(unmasked_tr_txt, unmasked_te_txt), "n_train": e3_tr_n, "n_test": e3_te_n})
 
         m4_ext_u = TfidfSvdExtractor(max_features=int(feat_cfg["tfidf_max_features"]), min_df=int(feat_cfg["tfidf_min_df"]), ngram_range=(1, 2), svd_components=best_svd_k, seed=primary_seed)
         _, svd_u_tr = m4_ext_u.fit_transform(unmasked_tr_txt, fit_svd=True)
@@ -428,25 +497,26 @@ def _run_scenario_a(
     pd.DataFrame(e3_rows).to_csv(metrics_dir / "e3_ablation.csv", index=False)
 
     # Bootstrap CI between M1 and M5 on Scenario A test
-    boot_ci = cluster_bootstrap_mae_diff(pred_dfs_test["M5"], pred_dfs_test["M1"], clean_df, n_boot=500, seed=primary_seed)
+    boot_ci = cluster_bootstrap_mae_diff(pred_dfs_test["M5"], pred_dfs_test["M1"], clean_df, n_boot=1000, seed=primary_seed)
     pd.DataFrame([{"comparison": "M5_minus_M1_A_test", **boot_ci}]).to_csv(metrics_dir / "bootstrap_ci.csv", index=False)
 
-    # Conformal C0-C3 on the val-selected best model (fallback to M5/M1 if M0/M2/M3 won)
-    if winner_id == "M1" and m1_cal_df is not None and m1_test_df is not None:
+    # Conformal C0-C3 on the best validation model among those with quantile heads (M1/M4/M5)
+    if winner_id == "M1":
         win_cal, win_test = m1_cal_df, m1_test_df
         win_model_obj = m1
-        win_kind = "M1"
     elif winner_id == "M4":
         win_cal = pd.read_parquet(preds_dir / f"A_M4_cal_seed{primary_seed}.parquet")
         win_test = pd.read_parquet(preds_dir / f"A_M4_test_seed{primary_seed}.parquet")
         win_model_obj = best_m4
-        win_kind = "M4"
-    else:
+    elif winner_id == "M5":
         win_cal, win_test = m5_cal_df, m5_test_df
         win_model_obj = best_m5
-        win_kind = "M5"
+    else:
+        raise RuntimeError(f"No conformal-capable model for winner {winner_id!r}")
+    win_kind = winner_id
 
-    assert win_cal is not None and win_test is not None
+    if win_cal is None or win_test is None:
+        raise RuntimeError(f"Missing cal/test predictions for conformal model {win_kind}")
     win_cal_meta = win_cal.merge(ca[["row_id", "property_type_name"]], on="row_id", how="left")
     win_test_meta = win_test.merge(te[["row_id", "property_type_name", "text_status", "area_mismatch_flag", "text_masked"]], on="row_id", how="left")
 
@@ -470,9 +540,11 @@ def _run_scenario_a(
     ev_c80 = evaluate_predictions_df(c2_80, clean_df, train_df=tr, alpha=alpha_sec, min_eval_group_size=int(cfg["conformal"]["min_eval_group_size"]))
     conformal_rows.append({"scenario": "A", "model_id": win_kind, "alpha": alpha_sec, "method": "C2_alpha0.20", **ev_c80["overall"]})
 
-    # Stale calibration control (train on early train 06-08/2025, calibrate on 09-10/2025, eval on test)
-    early_mask = tr["month"].isin(["2025-06", "2025-07", "2025-08"]).to_numpy()
-    late_mask = tr["month"].isin(["2025-09", "2025-10"]).to_numpy()
+    # Stale calibration control: ONE model (M1 trained on the early train months), calibrated twice and evaluated on test:
+    # stale = last train months (cfg stale_cal_months), fresh = the real cal split. Same model => differences = calibration only.
+    stale_months = [str(m) for m in cfg["splits"]["scenario_a"]["stale_cal_months"]]
+    late_mask = tr["month"].isin(stale_months).to_numpy()
+    early_mask = ~late_mask
     if early_mask.sum() >= 100 and late_mask.sum() >= 50:
         m1_stale = M1CatBoostModel(
             iterations=int(cb_cfg["iterations"]),
@@ -501,9 +573,19 @@ def _run_scenario_a(
             "q_hi": te_stale_q_hi,
             "property_type_name": te["property_type_name"].tolist(),
         })
-        c2_stale = fit_apply_conformal(stale_cal_df, stale_test_df, method="C2", alpha=alpha_pri, min_group_size=min_g)
-        ev_stale = evaluate_predictions_df(c2_stale, clean_df, train_df=tr, alpha=alpha_pri, min_eval_group_size=int(cfg["conformal"]["min_eval_group_size"]))
-        conformal_rows.append({"scenario": "A", "model_id": "M1_stale_train", "alpha": alpha_pri, "method": "C2_stale_cal", **ev_stale["overall"]})
+        fresh_q_lo, fresh_q_hi = m1_stale.predict_quantiles(X_ca_tab)
+        fresh_cal_df = pd.DataFrame({
+            "row_id": ca["row_id"].tolist(),
+            "y_true": y_ca,
+            "y_pred": m1_stale.predict(X_ca_tab),
+            "q_lo": fresh_q_lo,
+            "q_hi": fresh_q_hi,
+            "property_type_name": ca["property_type_name"].tolist(),
+        })
+        for label, cal_src in [("C2_stale_cal", stale_cal_df), ("C2_fresh_cal", fresh_cal_df)]:
+            c2_ctl = fit_apply_conformal(cal_src, stale_test_df, method="C2", alpha=alpha_pri, min_group_size=min_g)
+            ev_ctl = evaluate_predictions_df(c2_ctl, clean_df, train_df=tr, alpha=alpha_pri, min_eval_group_size=int(cfg["conformal"]["min_eval_group_size"]))
+            conformal_rows.append({"scenario": "A", "model_id": "M1_stale_train", "alpha": alpha_pri, "method": label, **ev_ctl["overall"]})
 
     # E6 Flagging, audit export & error analysis
     print("[Scenario A] Running Conformal/Flagging/Audit export & saving bundle...", flush=True)
@@ -559,6 +641,7 @@ def _run_scenario_a(
         "mask_token": cfg["project"]["mask_token"],
         "aliases_path": str(paths["aliases_path"].resolve()),
         "tabular_bounds": cfg["cleaning"]["tabular_bounds"],
+        "reconcile_cfg": {k: v for k, v in cfg["cleaning"].items() if k not in {"tabular_bounds", "train_ppm2_quantiles"}},
     }
     (bundle_dir / "bundle_meta.json").write_text(json.dumps(bundle_meta, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -570,9 +653,15 @@ def _run_scenario_a(
         lat_info = _measure_latency(lambda: best_m4.predict(X_te_tab.iloc[:n_lat], te_svd_b[:n_lat]), n_lat)
     else:
         lat_info = _measure_latency(lambda: m1.predict(X_te_tab.iloc[:n_lat]), n_lat)
+    lat_info["batch_predict_only"] = True
+    try:
+        lat_info.update(_measure_single_row_latency(bundle_dir, te, seed=primary_seed))
+    except Exception as exc:  # latency probe must never kill the run
+        lat_info["single_row_error"] = f"{type(exc).__name__}: {exc}"
 
     return {
-        "winner_id": win_kind,
+        "winner_id": val_winner_id,
+        "conformal_model_id": win_kind,
         "val_mae_by_model": val_mae_by_model,
         "metrics": all_metrics,
         "tuning_logs": tuning_logs,
@@ -607,10 +696,10 @@ def _run_scenario_b(
     X_ca_tab, _ = tab_ext.transform(ca)
     X_te_tab, _ = tab_ext.transform(te)
 
-    emb_tr = load_embeddings_for_row_ids(tr["row_id"].tolist(), cache_dir)
-    emb_va = load_embeddings_for_row_ids(va["row_id"].tolist(), cache_dir)
-    emb_ca = load_embeddings_for_row_ids(ca["row_id"].tolist(), cache_dir)
-    emb_te = load_embeddings_for_row_ids(te["row_id"].tolist(), cache_dir)
+    emb_tr = load_embeddings_for_row_ids(tr["row_id"].tolist(), cache_dir, cfg["project"]["text_version"])
+    emb_va = load_embeddings_for_row_ids(va["row_id"].tolist(), cache_dir, cfg["project"]["text_version"])
+    emb_ca = load_embeddings_for_row_ids(ca["row_id"].tolist(), cache_dir, cfg["project"]["text_version"])
+    emb_te = load_embeddings_for_row_ids(te["row_id"].tolist(), cache_dir, cfg["project"]["text_version"])
 
     metrics_b: list[dict[str, Any]] = []
     conformal_b: list[dict[str, Any]] = []
@@ -707,15 +796,14 @@ def _run_scenario_b(
         if sp_name == "test":
             m5_test = pdf
 
-    # Select Scenario B Conformal model strictly by Scenario B Validation MAE_log
-    winner_b = min(val_mae_b, key=lambda k: val_mae_b[k])
-    conformal_sources = {
-        "M1": (m1_cal, m1_test, "M1"),
-        "M4": (m4_cal, m4_test, "M4"),
-        "M5": (m5_cal, m5_test, "M5"),
-    }
-    sel_cal, sel_test, win_b_kind = conformal_sources.get(winner_b, (m5_cal, m5_test, "M5"))
-    assert sel_cal is not None and sel_test is not None
+    # Report the true validation winner (may be M0); pick the conformal model among M1/M4/M5 only.
+    val_winner_b = min(val_mae_b, key=lambda k: val_mae_b[k])
+    win_b_kind = _pick_conformal_model(val_mae_b)
+    print(f"[Scenario B] Validation winner: {val_winner_b}; conformal model: {win_b_kind} ({val_mae_b})", flush=True)
+    conformal_sources = {"M1": (m1_cal, m1_test), "M4": (m4_cal, m4_test), "M5": (m5_cal, m5_test)}
+    sel_cal, sel_test = conformal_sources[win_b_kind]
+    if sel_cal is None or sel_test is None:
+        raise RuntimeError(f"Missing cal/test predictions for Scenario B conformal model {win_b_kind}")
     win_cal_b = sel_cal.merge(ca[["row_id", "property_type_name"]], on="row_id", how="left")
     win_test_b = sel_test.merge(te[["row_id", "property_type_name"]], on="row_id", how="left")
     alpha_pri = float(cfg["conformal"]["alpha_primary"])
@@ -726,7 +814,14 @@ def _run_scenario_b(
         ev_c = evaluate_predictions_df(c_out, clean_df, train_df=tr, alpha=alpha_pri, min_eval_group_size=int(cfg["conformal"]["min_eval_group_size"]))
         conformal_b.append({"scenario": "B", "model_id": win_b_kind, "alpha": alpha_pri, "method": m_name, **ev_c["overall"]})
 
-    return {"winner_id": win_b_kind, "val_mae_by_model": val_mae_b, "metrics": metrics_b, "conformal_rows": conformal_b}
+    return {
+        "winner_id": val_winner_b,
+        "conformal_model_id": win_b_kind,
+        "val_mae_by_model": val_mae_b,
+        "metrics": metrics_b,
+        "conformal_rows": conformal_b,
+        "n_districts": {sp: int(d["district_key"].nunique()) for sp, d in splits.items()},
+    }
 
 
 def run_train_eval(cfg: dict[str, Any], paths: dict[str, Path]) -> dict[str, Any]:
@@ -755,9 +850,10 @@ def run_train_eval(cfg: dict[str, Any], paths: dict[str, Path]) -> dict[str, Any
     noisy_path = proc_dir / "noisy_flagged.parquet"
     noisy_df = pd.read_parquet(noisy_path) if noisy_path.exists() else pd.DataFrame()
 
-    # Strict leakage checks before training
-    leak_a = verify_split_leakage(man_a, text_df=clean_df[clean_df["row_id"].isin(man_a["row_id"])], scenario="A", strict_text=True)
-    leak_b = verify_split_leakage(man_b, text_df=clean_df[clean_df["row_id"].isin(man_b["row_id"])], scenario="B", strict_text=True)
+    # Strict leakage checks before training (tolerance 0 unless the config explicitly relaxes it)
+    leak_tol = float(cfg.get("leakage", {}).get("max_leaked_row_rate", 0.0))
+    leak_a =verify_split_leakage(man_a, text_df=clean_df[clean_df["row_id"].isin(man_a["row_id"])], scenario="A", strict_text=True, max_leak_rate=leak_tol)
+    leak_b = verify_split_leakage(man_b, text_df=clean_df[clean_df["row_id"].isin(man_b["row_id"])], scenario="B", strict_text=True, max_leak_rate=leak_tol)
     (metrics_dir / "leakage_verification.json").write_text(json.dumps({"A": leak_a, "B": leak_b}, indent=2, ensure_ascii=False), encoding="utf-8")
 
     res_a = _run_scenario_a(cfg, paths, clean_df, man_a, noisy_df)
@@ -782,6 +878,9 @@ def run_train_eval(cfg: dict[str, Any], paths: dict[str, Path]) -> dict[str, Any
     summary = {
         "winner_a": res_a["winner_id"],
         "winner_b": res_b["winner_id"],
+        "conformal_model_a": res_a["conformal_model_id"],
+        "conformal_model_b": res_b["conformal_model_id"],
+        "n_districts_b": res_b["n_districts"],
         "val_mae_a": res_a["val_mae_by_model"],
         "val_mae_b": res_b["val_mae_by_model"],
         "leakage": {

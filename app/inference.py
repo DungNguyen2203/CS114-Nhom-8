@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import time
 from typing import Any
 
@@ -152,6 +152,21 @@ SAMPLE_DEMO_LISTINGS: list[dict[str, Any]] = [
 ]
 
 
+# Fallback for bundles saved before `reconcile_cfg` existed; keep equal to configs/base.yaml `cleaning`.
+_DEFAULT_RECONCILE_CFG = {
+    "min_area_m2": 5.0,
+    "max_area_m2": 50000.0,
+    "min_price_vnd": 50_000_000.0,
+    "max_price_vnd": 2_000_000_000_000.0,
+    "min_price_per_m2_vnd": 500_000.0,
+    "max_price_per_m2_vnd": 3_000_000_000.0,
+    "price_mismatch_ratio_strict": 1.35,
+    "price_mismatch_ratio_approx": 1.60,
+    "order_of_magnitude_ratio": 5.0,
+    "area_mismatch_ratio": 1.30,
+}
+
+
 class ValuationInferenceService:
     """Single-listing inference matching train-time preprocessing, masking, and C2 CQR intervals."""
 
@@ -184,10 +199,12 @@ class ValuationInferenceService:
     def _get_phobert(self) -> PhoBERTEmbedder:
         if self._phobert is None:
             if "HF_HOME" not in os.environ:
-                cfg_hf = self.meta.get("hf_home")
-                if cfg_hf and (os.name != "nt" or Path(str(cfg_hf)).drive):
-                    os.environ["HF_HOME"] = str(cfg_hf)
-                elif Path("E:/hf_cache").exists():
+                cfg_hf = str(self.meta.get("hf_home") or "")
+                # Use the saved path only if it fits this OS: a drive letter on Windows, none on POSIX
+                # (a Windows "E:/hf_cache" on Linux would become a junk relative directory).
+                if cfg_hf and (os.name == "nt") == bool(PureWindowsPath(cfg_hf).drive):
+                    os.environ["HF_HOME"] = cfg_hf
+                elif os.name == "nt" and Path("E:/hf_cache").exists():
                     os.environ["HF_HOME"] = "E:/hf_cache"
             ph_cfg = self.meta.get("phobert", {})
             self._phobert = PhoBERTEmbedder(
@@ -314,18 +331,7 @@ class ValuationInferenceService:
                 float(asking),
                 float(clean_df.loc[0, "area"]),
                 parsed,
-                {
-                    "min_area_m2": 5.0,
-                    "max_area_m2": 50000.0,
-                    "min_price_vnd": 50_000_000.0,
-                    "max_price_vnd": 2_000_000_000_000.0,
-                    "min_price_per_m2_vnd": 500_000.0,
-                    "max_price_per_m2_vnd": 3_000_000_000.0,
-                    "price_mismatch_ratio_strict": 1.35,
-                    "price_mismatch_ratio_approx": 1.60,
-                    "order_of_magnitude_ratio": 5.0,
-                    "area_mismatch_ratio": 1.30,
-                },
+                self.meta.get("reconcile_cfg", _DEFAULT_RECONCILE_CFG),  # thresholds saved with the bundle at train time
             )
             text_consistency = rec.status
 

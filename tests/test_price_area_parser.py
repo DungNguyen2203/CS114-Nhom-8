@@ -126,3 +126,14 @@ def test_tr_prefix_words_cu_chi_and_bedrooms_not_parsed_as_price():
     p4 = parse_listing_text("Bán đất Hưng Yên 112m2", "Giá 41.000.000đ/m2 đầu tư hợp lý", tabular_area=112.0)
     assert abs(p4.unit_price_per_m2_vnd - 41_000_000.0) < 1e3
 
+
+
+def test_sale_listing_with_embedded_tenant_rent_is_not_rental():
+    for text in [
+        "Bán nhà đang cho thuê 20tr/tháng, sổ hồng chính chủ",
+        "Chính chủ bán nhà, hiện đang cho thuê 18 triệu/tháng",
+        "Bán nhà HĐT 20tr/th",
+    ]:
+        assert parse_listing_text(text, "", None).tx_type == "sale", text
+    assert parse_listing_text("CHO THUÊ nhà nguyên căn 15tr/tháng", "", None).tx_type == "rent"
+    assert parse_listing_text("Cho thuê nhà nguyên căn 15tr/tháng, sổ hồng chính chủ", "", None).tx_type == "rent"

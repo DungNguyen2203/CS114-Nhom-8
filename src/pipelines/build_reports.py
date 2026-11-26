@@ -36,7 +36,8 @@ def run_build_reports(cfg: dict[str, Any], paths: dict[str, Path]) -> dict[str, 
         "# Báo cáo Thực nghiệm & Đánh giá (TV2–TV4)",
         "",
         f"- **Profile cấu hình:** `{cfg.get('runtime', {}).get('profile_name', 'base')}`",
-        f"- **Mô hình thắng trên Validation:** Kịch bản A=`{run_sum.get('winner_a', run_sum.get('winner_id', 'N/A'))}`, Kịch bản B=`{run_sum.get('winner_b', 'N/A')}`",
+        f"- **Mô hình thắng trên Validation (MAE_log thấp nhất, mọi mô hình):** Kịch bản A=`{run_sum.get('winner_a', run_sum.get('winner_id', 'N/A'))}`, Kịch bản B=`{run_sum.get('winner_b', 'N/A')}`",
+        f"- **Mô hình dùng cho Conformal/bundle (tốt nhất trong M1/M4/M5, có hồi quy phân vị):** A=`{run_sum.get('conformal_model_a', 'N/A')}`, B=`{run_sum.get('conformal_model_b', 'N/A')}`",
         f"- **Kiểm tra rò rỉ split:** A=`{run_sum.get('leakage', {}).get('A')}`, B=`{run_sum.get('leakage', {}).get('B')}` (leaks A={run_sum.get('leakage', {}).get('leaks_a', 0)}, B={run_sum.get('leakage', {}).get('leaks_b', 0)})",
         "",
         "## 1. So sánh Mô hình Điểm (Kịch bản A & B — Test, seed chính)",
@@ -68,9 +69,20 @@ def run_build_reports(cfg: dict[str, Any], paths: dict[str, Path]) -> dict[str, 
                 f"- Tốc độ tách từ CPU (`pyvi`): {emb_stats.get('segmentation_sec_per_1k', 0):.2f}s / 1.000 văn bản",
                 f"- Tốc độ embedding PhoBERT: {emb_stats.get('embed_texts_per_sec', 0):.1f} văn bản/s, Peak VRAM: {emb_stats.get('peak_vram_mb', 0):.1f} MB",
                 f"- Tỷ lệ văn bản chạm giới hạn 256 token: {100*emb_stats.get('truncated_ratio', 0):.2f}%",
-                f"- Độ trễ suy luận trung bình/tin: {run_sum.get('latency', {}).get('per_row_mean_ms', 0):.3f} ms",
+                f"- Độ trễ chỉ phần dự đoán mô hình (batch, trung bình/tin): {run_sum.get('latency', {}).get('per_row_mean_ms', 0):.3f} ms",
             ]
         )
+    lat = run_sum.get("latency", {})
+    if "single_row_median_ms" in lat:
+        lines.extend(
+            [
+                "",
+                "## 5b. Độ trễ đầu-cuối (từng tin qua `ValuationInferenceService`: ẩn giá + đặc trưng + mô hình + conformal)",
+                f"- Trung vị: {lat['single_row_median_ms']:.1f} ms, p95: {lat['single_row_p95_ms']:.1f} ms (n={lat.get('single_row_n')})",
+            ]
+        )
+    elif "single_row_error" in lat:
+        lines.extend(["", f"- Không đo được độ trễ đầu-cuối: `{lat['single_row_error']}`"])
 
     lines.extend(
         [
@@ -78,7 +90,18 @@ def run_build_reports(cfg: dict[str, Any], paths: dict[str, Path]) -> dict[str, 
             "## 6. Giới hạn & Phạm vi Sử dụng",
             "- Mô hình ước lượng **giá chào bán** giai đoạn `06/2025–03/2026`, không thay thế thẩm định giá hay căn cứ giao dịch/cho vay.",
             "- Dữ liệu tập trung mạnh ở Hà Nội & TP.HCM (~71%), địa giới có độ lệch trước/sau 07/2025, và độ phủ conformal có thể lệch ở nhóm hiếm hoặc khi thị trường dịch chuyển theo thời gian.",
+            "- `crossing_rate_raw` ở bảng conformal là tỷ lệ cặp phân vị bị đảo (q_lo > q_hi) của mô hình gốc, đo TRƯỚC khi sắp xếp/hiệu chỉnh.",
+            "- Đối chứng E5: cùng một mô hình M1 (huấn luyện trên các tháng train đầu) được hiệu chỉnh hai lần — `C2_stale_cal` (các tháng cuối train) và `C2_fresh_cal` (tập cal thật) — nên chênh lệch chỉ do hiệu chỉnh.",
         ]
+    )
+    nd = run_sum.get("n_districts_b")
+    if nd:
+        lines.append(
+            f"- Kịch bản B chỉ có {nd.get('cal', '?')} quận/huyện ở tập cal và {nd.get('test', '?')} ở tập test: độ phủ conformal có thể lệch xa mục tiêu "
+            "(giả định hoán đổi theo hàng không còn đúng giữa các quận), nên đọc cùng độ rộng khoảng (`median_ratio_hi_lo`)."
+        )
+    lines.append(
+        "- Đối chứng rò rỉ E3 (M4/M5 nén văn bản bằng SVD/PCA) kém nhạy với số tiền còn sót; chênh lệch masked–unmasked nhỏ chưa chứng minh không còn rò rỉ."
     )
     (reports_dir / "experiment_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 

@@ -1,9 +1,9 @@
 project:
   name: vn-realestate-valuation
-  rules_version: v1.0.2
+  rules_version: v1.1.0
   seeds: [42, 17, 2026]
   primary_seed: 42
-  text_version: v1.0.0
+  text_version: v1.1.0
   mask_token: MASK_GIA
 
 dataset:
@@ -98,6 +98,9 @@ conformal:
   alpha_secondary: 0.20
   c3_min_group_samples: 500
   min_eval_group_size: 500
+
+leakage:
+  max_leaked_row_rate: 0.0   # fraction of manifest rows allowed to keep a money mention after masking (0 = strict)
 
 audits:
   label_audit_size: 300

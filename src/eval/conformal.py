@@ -10,13 +10,14 @@ import pandas as pd
 
 
 def finite_sample_quantile(scores: np.ndarray, alpha: float) -> float:
-    """Compute exact finite-sample conformal quantile ceil((n+1)*(1-alpha))/n."""
+    """Return the k-th smallest score, k = ceil((n+1)*(1-alpha)) clipped to [1, n] (exact order statistic)."""
     arr = np.asarray(scores, dtype=np.float64)
     n = len(arr)
     if n == 0:
         raise ValueError("Calibration set cannot be empty.")
-    level = min(1.0, max(0.0, math.ceil((n + 1) * (1.0 - float(alpha))) / n))
-    return float(np.quantile(arr, level, method="higher"))
+    # np.quantile(level=k/n, method="higher") returns rank k+1 when k/n is inexact in float; index directly instead.
+    k = min(n, max(1, math.ceil((n + 1) * (1.0 - float(alpha)) - 1e-12)))
+    return float(np.partition(arr, k - 1)[k - 1])
 
 
 def fit_apply_conformal(
@@ -41,6 +42,7 @@ def fit_apply_conformal(
             raise ValueError("C0 requires q_lo and q_hi columns.")
         lo_e = out["q_lo"].to_numpy(dtype=np.float64)
         hi_e = out["q_hi"].to_numpy(dtype=np.float64)
+        out["crossed_raw"] = lo_e > hi_e
         out["crossing_rate_raw"] = float(np.mean(lo_e > hi_e))
         out["q_lo"] = np.minimum(lo_e, hi_e)
         out["q_hi"] = np.maximum(lo_e, hi_e)
@@ -67,6 +69,7 @@ def fit_apply_conformal(
 
         lo_e_raw = out["q_lo"].to_numpy(dtype=np.float64)
         hi_e_raw = out["q_hi"].to_numpy(dtype=np.float64)
+        out["crossed_raw"] = lo_e_raw > hi_e_raw
         out["crossing_rate_raw"] = float(np.mean(lo_e_raw > hi_e_raw))
         lo_e = np.minimum(lo_e_raw, hi_e_raw)
         hi_e = np.maximum(lo_e_raw, hi_e_raw)

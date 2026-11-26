@@ -88,9 +88,24 @@ def save_embedding_cache(
     (cache_dir / "cache_meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def load_embeddings_for_row_ids(row_ids: Sequence[str], cache_dir: Path) -> np.ndarray:
-    """Load embeddings strictly aligned to `row_ids` via `phobert_index.parquet`."""
+def load_embeddings_for_row_ids(
+    row_ids: Sequence[str],
+    cache_dir: Path,
+    expected_text_version: str | None = None,
+) -> np.ndarray:
+    """Load embeddings strictly aligned to `row_ids` via `phobert_index.parquet`.
+
+    With `expected_text_version`, refuse a cache built from another masking/text version (stale embeddings).
+    """
     cache_dir = Path(cache_dir)
+    if expected_text_version is not None:
+        meta_path = cache_dir / "cache_meta.json"
+        cached = json.loads(meta_path.read_text(encoding="utf-8")).get("text_version") if meta_path.exists() else None
+        if cached != expected_text_version:
+            raise ValueError(
+                f"PhoBERT cache text_version={cached!r} != expected {expected_text_version!r}; "
+                "re-run extract_embeddings after changing masking/text rules."
+            )
     idx_df = pd.read_parquet(cache_dir / "phobert_index.parquet")
     id_to_off = dict(zip(idx_df["row_id"].astype(str), idx_df["offset"].astype(int)))
 

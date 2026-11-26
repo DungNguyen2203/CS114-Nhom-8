@@ -35,13 +35,18 @@ def compute_interval_metrics(
     q_lo: np.ndarray,
     q_hi: np.ndarray,
     alpha: float = 0.10,
+    crossed_raw: np.ndarray | None = None,
 ) -> dict[str, float]:
-    """Compute conformal coverage, width, crossing rate, and Winkler interval score."""
+    """Compute conformal coverage, width, crossing rate, and Winkler interval score.
+
+    `crossed_raw` = per-row flag recorded BEFORE sorting/conformal adjustment (from `fit_apply_conformal`);
+    without it, crossing is measured on the bounds given, which are already sorted for conformal rows.
+    """
     yt = np.asarray(y_true, dtype=np.float64)
     lo_raw = np.asarray(q_lo, dtype=np.float64)
     hi_raw = np.asarray(q_hi, dtype=np.float64)
 
-    crossing_rate_raw = float(np.mean(lo_raw > hi_raw))
+    crossing_rate_raw = float(np.mean(crossed_raw)) if crossed_raw is not None else float(np.mean(lo_raw > hi_raw))
     lo = np.minimum(lo_raw, hi_raw)
     hi = np.maximum(lo_raw, hi_raw)
 
@@ -92,6 +97,7 @@ def evaluate_predictions_df(
                 merged["q_lo"].to_numpy(),
                 merged["q_hi"].to_numpy(),
                 alpha=alpha,
+                crossed_raw=merged["crossed_raw"].to_numpy(dtype=bool) if "crossed_raw" in merged.columns else None,
             )
         )
 
@@ -120,7 +126,15 @@ def evaluate_predictions_df(
             row = {"group_dim": dim, "group_val": str(gval), "eligible_min_n": len(sub) >= min_eval_group_size}
             row.update(compute_point_metrics(sub["y_true"].to_numpy(), sub["y_pred"].to_numpy()))
             if has_intervals:
-                row.update(compute_interval_metrics(sub["y_true"].to_numpy(), sub["q_lo"].to_numpy(), sub["q_hi"].to_numpy(), alpha=alpha))
+                row.update(
+                    compute_interval_metrics(
+                        sub["y_true"].to_numpy(),
+                        sub["q_lo"].to_numpy(),
+                        sub["q_hi"].to_numpy(),
+                        alpha=alpha,
+                        crossed_raw=sub["crossed_raw"].to_numpy(dtype=bool) if "crossed_raw" in sub.columns else None,
+                    )
+                )
             group_rows.append(row)
 
     group_df = pd.DataFrame(group_rows)
@@ -138,7 +152,7 @@ def cluster_bootstrap_mae_diff(
     pred_a_df: pd.DataFrame,
     pred_b_df: pd.DataFrame,
     meta_df: pd.DataFrame,
-    n_boot: int = 500,
+    n_boot: int = 1000,
     seed: int = 42,
 ) -> dict[str, float]:
     """District-cluster bootstrap 95% CI for `MAE_log(A) - MAE_log(B)`."""
