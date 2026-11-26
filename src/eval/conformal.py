@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from fractions import Fraction
 from typing import Any
 
 import numpy as np
@@ -10,13 +11,17 @@ import pandas as pd
 
 
 def finite_sample_quantile(scores: np.ndarray, alpha: float) -> float:
-    """Return the k-th smallest score, k = ceil((n+1)*(1-alpha)) clipped to [1, n] (exact order statistic)."""
+    """Return the finite conformal order statistic or raise if that rank exceeds n."""
     arr = np.asarray(scores, dtype=np.float64)
     n = len(arr)
-    if n == 0:
-        raise ValueError("Calibration set cannot be empty.")
-    # np.quantile(level=k/n, method="higher") returns rank k+1 when k/n is inexact in float; index directly instead.
-    k = min(n, max(1, math.ceil((n + 1) * (1.0 - float(alpha)) - 1e-12)))
+    if arr.ndim != 1 or n == 0 or not np.isfinite(arr).all():
+        raise ValueError("Expected a nonempty vector of finite calibration scores.")
+    if not 0 < alpha < 1:
+        raise ValueError("alpha must lie strictly between zero and one.")
+    # Decimal alpha comes from YAML. Binary rounding at an integer rank can shift it by one.
+    k = (n + 1) - math.floor((n + 1) * Fraction(str(alpha)))
+    if k > n:
+        raise ValueError(f"Insufficient calibration samples for alpha={alpha}: n={n}, rank={k}")
     return float(np.partition(arr, k - 1)[k - 1])
 
 
@@ -74,7 +79,8 @@ def fit_apply_conformal(
         lo_e = np.minimum(lo_e_raw, hi_e_raw)
         hi_e = np.maximum(lo_e_raw, hi_e_raw)
 
-        scores_cal = np.maximum(lo_c - y_cal, y_cal - hi_c)
+        # Conservative CQR expands the raw interval or leaves its width intact.
+        scores_cal = np.maximum(np.maximum(lo_c - y_cal, y_cal - hi_c), 0.0)
         global_q = finite_sample_quantile(scores_cal, alpha=alpha)
 
         if method_u == "C2":
@@ -95,6 +101,7 @@ def fit_apply_conformal(
         tier_eval = np.digitize(pred_eval, edges[1:-1])
 
         # Compute per-(ptype, tier) and per-ptype Q tables
+        min_group_size = max(min_group_size, math.ceil(1 / Fraction(str(alpha))) - 1)
         pt_tier_q: dict[tuple[str, int], float] = {}
         for pt in np.unique(pt_cal):
             for tr in [0, 1, 2]:

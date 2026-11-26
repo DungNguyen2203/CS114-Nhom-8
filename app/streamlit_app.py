@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import sys
 
 import pandas as pd
@@ -13,13 +14,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.inference import SAMPLE_DEMO_LISTINGS, ValuationInferenceService
+from src.config import resolve_project_paths
 
 
 st.set_page_config(page_title="Định giá BĐS Việt Nam & Conformal", layout="wide")
 
 
 @st.cache_resource
-def _load_service(bundle_path: str) -> ValuationInferenceService:
+def _load_service(bundle_path: str, metadata_bytes: bytes) -> ValuationInferenceService:
     return ValuationInferenceService.load(bundle_path)
 
 
@@ -34,16 +36,21 @@ def main() -> None:
         "Không thay thế thẩm định giá chuyên nghiệp và không dùng làm căn cứ mua bán/cho vay."
     )
 
-    bundle_dir = ROOT / "models" / "bundle_a"
-    outputs_dir = ROOT / "outputs"
+    paths = resolve_project_paths({})
+    bundle_dir = paths["models_dir"] / "bundle_a"
+    outputs_dir = paths["outputs_dir"]
+    meta_path = bundle_dir / "bundle_meta.json"
+    metadata = meta_path.read_bytes() if meta_path.exists() else b""
 
     tab_demo, tab_eval = st.tabs(["1. Định giá & Kiểm tra tin", "2. Bảng Kết quả & Độ phủ (E1–E6)"])
 
     with tab_demo:
-        if not (bundle_dir / "bundle_meta.json").exists():
+        if not metadata:
             st.warning("Chưa tìm thấy model bundle tại `models/bundle_a`. Hãy chạy pipeline `train_eval` trước.")
         else:
-            svc = _load_service(str(bundle_dir))
+            svc = _load_service(str(bundle_dir), metadata)
+            if not svc.meta.get("run_id"):
+                st.warning("Bundle lịch sử chưa có mã lần huấn luyện để đối chiếu kết quả.")
             sample_names = ["(Nhập thủ công)"] + [s["label"] for s in SAMPLE_DEMO_LISTINGS]
             chosen = st.selectbox("Chọn tin mẫu minh họa (đã ẩn thông tin liên hệ):", sample_names)
             preset = next((s for s in SAMPLE_DEMO_LISTINGS if s["label"] == chosen), {})
@@ -68,6 +75,7 @@ def main() -> None:
                     bedroom_count = st.number_input("Số phòng ngủ (0 = không rõ)", min_value=0.0, max_value=50.0, value=float(preset.get("bedroom_count") or 0.0))
                     bathroom_count = st.number_input("Số phòng tắm (0 = không rõ)", min_value=0.0, max_value=50.0, value=float(preset.get("bathroom_count") or 0.0))
                     frontage = st.number_input("Mặt tiền (m, 0 = không rõ)", min_value=0.0, max_value=100.0, value=float(preset.get("frontage_width") or 0.0))
+                    depth = st.number_input("Chiều sâu (m, 0 = không rõ)", min_value=0.0, max_value=200.0, value=float(preset.get("house_depth") or 0.0))
                 with c3:
                     road_width = st.number_input("Đường rộng (m, 0 = không rõ)", min_value=0.0, max_value=100.0, value=float(preset.get("road_width") or 0.0))
                     house_dir = st.text_input("Hướng nhà", value=str(preset.get("house_direction") or ""))
@@ -97,6 +105,7 @@ def main() -> None:
                     "bedroom_count": bedroom_count if bedroom_count > 0 else None,
                     "bathroom_count": bathroom_count if bathroom_count > 0 else None,
                     "frontage_width": frontage if frontage > 0 else None,
+                    "house_depth": depth if depth > 0 else None,
                     "road_width": road_width if road_width > 0 else None,
                     "house_direction": house_dir or None,
                     "balcony_direction": balcony_dir or None,
@@ -125,8 +134,12 @@ def main() -> None:
                 elif res["price_position"] == "in_interval":
                     st.success("Giá chào nhập vào **NẰM TRONG** khoảng dự đoán Conformal 90%.")
 
-                if res["text_consistency"] not in {"not_checked", "clean_consistent", "clean_no_text_price"}:
-                    st.error(f"Cảnh báo G2 (đối chiếu văn bản): `{res['text_consistency']}` — giá chào mâu thuẫn với nội dung mô tả.")
+                if res["flag_g2"] == "area_mismatch":
+                    st.warning("Cảnh báo G2: Diện tích trong mô tả khác với diện tích đã nhập.")
+                elif res["flag_g2"] != "none":
+                    st.error(f"Cảnh báo G2: `{res['flag_g2']}` — kiểm tra lại giá chào, diện tích và mô tả.")
+                elif res["text_consistency"] not in {"not_checked", "clean_consistent", "clean_no_text_price"}:
+                    st.info(f"Kết quả kiểm tra loại tin: `{res['text_consistency']}`.")
 
                 with st.expander("Văn bản sau khi ẩn mọi số tiền (đầu vào thực tế cho NLP)"):
                     st.code(res["masked_text"])
@@ -139,6 +152,12 @@ def main() -> None:
 
     with tab_eval:
         metrics_dir = outputs_dir / "metrics"
+        summary_path = metrics_dir / "run_summary.json"
+        summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
+        bundle_id = json.loads(metadata).get("run_id") if metadata else None
+        if not bundle_id or bundle_id != summary.get("run_id"):
+            st.info("Chưa có bảng đánh giá đã xác minh cho bundle đang mở.")
+            return
         figs_dir = outputs_dir / "figures"
         mc_p = metrics_dir / "model_comparison.csv"
         cf_p = metrics_dir / "conformal_summary.csv"

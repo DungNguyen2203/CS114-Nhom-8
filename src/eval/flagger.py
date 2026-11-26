@@ -12,6 +12,16 @@ from src.data.splits import stratified_sample_df
 from src.data.text_normalizer import redact_pii
 
 
+def classify_g2(status: str, area_mismatch: bool) -> str:
+    if status == "noisy_order_of_magnitude":
+        return "order_of_magnitude_mismatch"
+    if status == "noisy_price_mismatch":
+        return "price_mismatch"
+    if status in {"noisy_extreme_area", "noisy_extreme_price", "noisy_extreme_ppm2"}:
+        return "extreme_domain_mismatch"
+    return "area_mismatch" if area_mismatch else "none"
+
+
 def flag_mispriced_listings(eval_df: pd.DataFrame) -> pd.DataFrame:
     """Assign G1 (outside conformal interval) and G2 (text-vs-tabular mismatch) flags."""
     out = eval_df.copy().reset_index(drop=True)
@@ -25,20 +35,7 @@ def flag_mispriced_listings(eval_df: pd.DataFrame) -> pd.DataFrame:
     text_statuses = out["text_status"].astype(str) if "text_status" in out.columns else pd.Series(["clean_no_text_price"] * len(out))
     area_flags = out["area_mismatch_flag"].fillna(False).astype(bool) if "area_mismatch_flag" in out.columns else pd.Series([False] * len(out))
 
-    g2_list: list[str] = []
-    for st, af in zip(text_statuses, area_flags):
-        if st == "noisy_order_of_magnitude":
-            g2_list.append("order_of_magnitude_mismatch")
-        elif st == "noisy_price_mismatch":
-            g2_list.append("price_mismatch")
-        elif st in {"noisy_extreme_area", "noisy_extreme_price", "noisy_extreme_ppm2"}:
-            g2_list.append("extreme_domain_mismatch")
-        elif bool(af):
-            g2_list.append("area_mismatch")
-        else:
-            g2_list.append("none")
-
-    out["flag_g2"] = g2_list
+    out["flag_g2"] = [classify_g2(st, af) for st, af in zip(text_statuses, area_flags)]
     out["is_flagged"] = (out["flag_g1"] != "in_interval") | (out["flag_g2"] != "none")
     return out
 

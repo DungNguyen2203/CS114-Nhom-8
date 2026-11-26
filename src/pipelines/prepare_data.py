@@ -9,6 +9,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+from tempfile import TemporaryDirectory, mkdtemp
+from uuid import uuid4
 from typing import Any
 
 import numpy as np
@@ -17,8 +19,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from src.config import load_config, resolve_project_paths, set_global_seed
-from src.data.dedup import assign_duplicate_groups
-from src.data.download import download_dataset_shards
+from src.data.dedup import deduplicate_parquet
+from src.data.download import download_dataset_shards, sha256_file
+from src.pipelines.provenance import PREPARED_FILES, file_hashes, prepare_settings
 from src.data.location_normalizer import LocationNormalizer
 from src.data.price_area_parser import parse_listing_text, reconcile_labels
 from src.data.splits import apply_stratified_budget, build_scenario_a_split, build_scenario_b_split, stratified_sample_df
@@ -73,7 +76,8 @@ def _process_batch(
     # Drop heavy unnormalized text columns right after normalization
     batch_df = batch_df.drop(columns=[c for c in ["name", "description"] if c in batch_df.columns])
 
-    prices = pd.to_numeric(batch_df["price"], errors="coerce").tolist()
+    batch_df["price"] = pd.to_numeric(batch_df["price"], errors="coerce").astype("float64")
+    prices = batch_df["price"].tolist()
     areas = pd.to_numeric(batch_df["area"], errors="coerce").tolist()
 
     buckets: list[str] = []
@@ -162,13 +166,15 @@ class _ParquetStreamWriter:
         self.rows_written: int = 0
 
     def write(self, df: pd.DataFrame) -> None:
-        if len(df) == 0:
-            return
         # Ensure consistent object/string columns across batches
         for col in df.columns:
             if pd.api.types.is_string_dtype(df[col]) or df[col].dtype == object:
                 df[col] = df[col].fillna("").astype(str)
         table = pa.Table.from_pandas(df, preserve_index=False)
+        if not len(df):
+            if self.schema is None:
+                self.schema = table.schema
+            return
         if self.writer is None:
             self.schema = table.schema
             self.writer = pq.ParquetWriter(self.path, self.schema, compression="snappy")
@@ -180,8 +186,8 @@ class _ParquetStreamWriter:
     def close(self) -> None:
         if self.writer is not None:
             self.writer.close()
-        elif not self.path.exists():
-            pd.DataFrame().to_parquet(self.path, index=False)
+        else:
+            pq.write_table(pa.Table.from_batches([], schema=self.schema or pa.schema([])), self.path)
 
 
 def _process_single_shard_worker(task: tuple[int, str, dict[str, Any], str, str]) -> tuple[int, dict[str, int], int]:
@@ -231,28 +237,29 @@ def _process_single_shard_worker(task: tuple[int, str, dict[str, Any], str, str]
 
 def _merge_shard_parquets(part_paths: list[Path], out_path: Path) -> int:
     """Merge per-shard parquet files sequentially without holding entire tables in RAM."""
-    writer: pq.ParquetWriter | None = None
-    target_schema: pa.Schema | None = None
     total_rows = 0
-    for p in part_paths:
-        if not p.exists():
-            continue
-        pf = pq.ParquetFile(p)
-        if pf.metadata.num_rows == 0:
-            continue
-        for rg_idx in range(pf.num_row_groups):
-            tbl = pf.read_row_group(rg_idx)
-            if writer is None:
-                target_schema = tbl.schema
-                writer = pq.ParquetWriter(out_path, target_schema, compression="snappy")
-            elif tbl.schema != target_schema:
-                tbl = tbl.cast(target_schema)
-            writer.write_table(tbl)
-            total_rows += tbl.num_rows
-    if writer is not None:
-        writer.close()
-    elif not out_path.exists():
-        pd.DataFrame().to_parquet(out_path, index=False)
+    with TemporaryDirectory(dir=out_path.parent) as temp:
+        staged = Path(temp) / out_path.name
+        writer = None
+        empty_schema = pa.schema([])
+        try:
+            for path in part_paths:
+                with pq.ParquetFile(path) as part:
+                    if not part.metadata.num_rows:
+                        if len(part.schema_arrow):
+                            empty_schema = part.schema_arrow
+                        continue
+                    for batch in part.iter_batches(batch_size=50_000):
+                        if writer is None:
+                            writer = pq.ParquetWriter(staged, batch.schema, compression="snappy")
+                        writer.write_batch(batch.cast(writer.schema))
+                        total_rows += len(batch)
+        finally:
+            if writer is not None:
+                writer.close()
+        if writer is None:
+            pq.write_table(pa.Table.from_batches([], schema=empty_schema), staged)
+        staged.replace(out_path)
     return total_rows
 
 
@@ -509,16 +516,16 @@ def run_prepare_data(
             max_shards=max_shards,
         )
         shard_paths = [Path(s["path"]) for s in manifest["shards"]]
+        raw_source = {"repo_id": manifest["repo_id"], "revision": manifest["revision"],
+                      "shards": [s["sha256"] for s in manifest["shards"]]}
     else:
         shard_paths = list(raw_shards)
+        raw_source = {"shards": [sha256_file(p) for p in shard_paths]}
 
     clean_path = paths["processed_dir"] / "clean.parquet"
     noisy_path = paths["processed_dir"] / "noisy_flagged.parquet"
     rental_path = paths["processed_dir"] / "rental_unknown.parquet"
-    tmp_shards_dir = paths["processed_dir"] / "_tmp_shards"
-    if tmp_shards_dir.exists():
-        shutil.rmtree(tmp_shards_dir)
-    tmp_shards_dir.mkdir(parents=True, exist_ok=True)
+    tmp_shards_dir = Path(mkdtemp(prefix="_tmp_shards_", dir=paths["processed_dir"]))
 
     funnel = {
         "total_raw": 0,
@@ -573,22 +580,13 @@ def run_prepare_data(
         "text_masked",
     ]
     if clean_rows_written > 0:
-        pf_clean = pq.ParquetFile(clean_path)
-        meta_parts = []
-        for batch in pf_clean.iter_batches(batch_size=100_000, columns=dedup_cols):
-            bdf = batch.to_pandas()
-            # Keep only leading 300 chars of text_masked in RAM for dedup
-            bdf["text_masked"] = bdf["text_masked"].astype(str).str.slice(0, 300)
-            meta_parts.append(bdf)
-        clean_meta = pd.concat(meta_parts, axis=0, ignore_index=True)
-        print(f"[TV1] Running dedup on {len(clean_meta):,} clean rows...", flush=True)
-        clean_meta["dup_group_id"] = assign_duplicate_groups(
-            clean_meta,
+        print(f"[TV1] Running dedup on {clean_rows_written:,} clean rows...", flush=True)
+        clean_meta = deduplicate_parquet(
+            clean_path, dedup_cols,
             threshold=float(cfg["dedup"]["minhash_threshold"]),
             num_perm=int(cfg["dedup"]["minhash_num_perm"]),
             ngram_size=int(cfg["dedup"]["ngram_size"]),
         )
-        clean_meta = clean_meta.drop(columns=["text_masked"])
     else:
         clean_meta = pd.DataFrame(columns=dedup_cols + ["dup_group_id"])
 
@@ -618,8 +616,14 @@ def run_prepare_data(
     )
 
     summary = {
-        "dataset_repo": cfg["dataset"]["repo_id"],
-        "dataset_revision": cfg["dataset"]["revision"],
+        "dataset_repo": raw_source.get("repo_id", "local_shards"),
+        "dataset_revision": raw_source.get("revision", "see provenance/source/shards"),
+        "provenance": {
+            "prepare_id": uuid4().hex,
+            "settings": prepare_settings(cfg, paths),
+            "source": raw_source,
+            "files": file_hashes(paths["processed_dir"], PREPARED_FILES),
+        },
         "rules_version": cfg["project"]["rules_version"],
         "shards_processed": len(shard_paths),
         "funnel": funnel,
@@ -636,8 +640,14 @@ def run_prepare_data(
         },
         "audits": audits_meta,
     }
-    (splits_dir / "split_manifest.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     _write_data_reports(paths["reports_dir"], summary, clean_meta, diag_a)
+    summary["provenance"]["reports"] = file_hashes(
+        paths["reports_dir"], ["data_report.md", "data_dictionary.md"]
+    )
+    with TemporaryDirectory(dir=splits_dir) as temp:
+        staged = Path(temp) / "split_manifest.json"
+        staged.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        staged.replace(splits_dir / staged.name)
     return summary
 
 

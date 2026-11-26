@@ -94,7 +94,10 @@ def tune_catboost_grid(
             "loss_function": loss,
             "depth": depth,
             "learning_rate": lr,
-            "best_iteration": int(model.get_best_iteration() or iterations),
+            "best_iteration": model.get_best_iteration(),
+            "iterations": iterations,
+            "early_stopping_rounds": early_stopping_rounds,
+            "seed": seed,
             "val_mae": val_mae,
             "train_time_sec": elapsed,
         }

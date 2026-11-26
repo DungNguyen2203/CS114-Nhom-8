@@ -13,6 +13,18 @@ _TY = r"(?:tỷ|tỉ|ty|tỏi|ti(?!\s*(?:vi|le|lệ)\b))"
 _TRIEU = r"(?:triệu|trieu|tr)"
 # Spoken number words (hai mươi, ba trăm năm mươi, ...).
 _NUMW = r"(?:một|mốt|hai|ba|bốn|tư|năm|lăm|sáu|bảy|bẩy|tám|chín|mười|mươi|chục|trăm|linh|lẻ|rưỡi)"
+_COUNT_NOUN = r"(?:công\s+nhân|người|dân|cư\s+dân|việc\s+làm|khách|hộ\s+dân|sinh\s+viên)\b"
+_NON_PRICE_PREFIX = re.compile(
+    r"(?:\d+(?:[.,]\d+)?\s*m?\s*[x×*]|\b(?:quận|phường|đường|hẻm|ngõ))\s*$",
+    re.IGNORECASE,
+)
+_PHYSICAL_UNIT = r"(?:m[²2]?\b|mét\b|ha\b|%|tầng\b|lầu\b|phòng\b|căn\b|lô\b(?!\s*\d)|nền\b|năm\b|tháng\b|ngày\b|x\s*\d)"
+_IMPLICIT_PRICE_RE = re.compile(
+    r"(?P<cue>\bgiá\s*(?:(?:bán|chào|chỉ|từ)\s*)?[:=]?\s*)"
+    r"(?:\d+[.,]\d+(?=\s+(?:lô|căn|nền)\b)|"
+    r"\d+(?:[.,]\d+)*(?:\s*[-–—]\s*\d+(?:[.,]\d+)*)?\b"
+    r"(?![.,]\d|/\d|\s*[-–—]\s*\d|\s*" + _PHYSICAL_UNIT + r"))", re.IGNORECASE,
+)
 
 # Order matters: longer composite phrases first so sub-parts do not remain unmasked.
 _MASK_PATTERNS = [
@@ -21,7 +33,8 @@ _MASK_PATTERNS = [
     re.compile(
         r"\b\d+(?:[.,]\d+)?\s*(?:-|–|—|~|đến|tới)\s*"
         r"(?=(?:\d+(?:[.,]\d+)?\s*(?:-|–|—|~|đến|tới)\s*)*"  # chained "20 - 25 - 30 tỷ"
-        r"\d+(?:[.,]?\d*)?[xX]*[.,]{0,3}\s*(?:tỷ|tỉ|ty|tỏi|ti\b|triệu|trieu|tr\b|củ(?!\s+chi\b)|k\s*/))",
+        r"\d+(?:[.,]\d+)*[.,]?[xX]*[.,]{0,3}\s*(?:tỷ|tỉ|ty|tỏi|ti\b|triệu|trieu|tr\b|củ(?!\s+chi\b)|k\s*/|"
+        r"đồng\b|vnd\b|vnđ\b|đ\b(?:\s*/|(?<!\sđ))|(?:ngàn|nghìn)\b(?!\s+" + _COUNT_NOUN + r")))",
         re.IGNORECASE,
     ),
     # e.g. "9 tỷ 100 triệu", "3 tỷ 950", "6.tỷ 350", "4,Tỷ 780" (do NOT eat bedroom/floor count like "5 ty 2 ngủ")
@@ -35,12 +48,12 @@ _MASK_PATTERNS = [
     ),
     # e.g. "8,x tỷ", "5.4xx tỷ", "6xxtr", "1x tỷ", "7.x đồng"
     re.compile(
-        r"\b\d+(?:[.,]?\d*)?[.,]{0,3}[xX]+\s*(?:tỷ|tỉ|ty|tỏi|triệu|trieu|tr|đồng)\b(?:\s*/\s*(?:1\s*)?(?:m2|m²|tháng|th|t\b|căn|lô))?",
+        r"\b\d+(?:[.,]?\d*)?[.,]{0,3}[xX]+\s*(?:tỷ|tỉ|ty|tỏi|triệu|trieu|tr|đồng|vnđ|vnd|(?:ngàn|nghìn)(?!\s+" + _COUNT_NOUN + r"))\b(?:\s*/\s*(?:1\s*)?(?:m2|m²|tháng|th|t\b|căn|lô))?",
         re.IGNORECASE,
     ),
     # e.g. "7.45 tỷ", "7,5tỷ", "4. tỷ", "5.8..tỷ", "4,.tỷ", "13.TỶ", "40, tỷ", "8.2.tỷ", "6 tỷ rưỡi", "3.5 tỏi", "5ti"
     re.compile(
-        r"\b\d+(?:[.,]\d+)?[.,]{0,3}\s*" + _TY + r"\b(?:\s*(?:rưỡi|hơn))?(?:\s*/\s*(?:1\s*)?(?:m2|m²|mét|tháng|th|t\b|ngày|năm|căn|lô))?",
+        r"\b\d+(?:[.,]\d+)?[.,]*\s*" + _TY + r"\b(?:\s*(?:rưỡi|hơn))?(?:\s*/\s*(?:1\s*)?(?:m2|m²|mét|tháng|th|t\b|ngày|năm|căn|lô))?",
         re.IGNORECASE,
     ),
     # e.g. "500tr", "500.triệu", "800trieu", "45.Tr/Tháng", "110tr/m2", "62tr/1m2", "20tr/t" (strict \b avoids 1 trệt / 2 Củ Chi)
@@ -54,7 +67,7 @@ _MASK_PATTERNS = [
         re.IGNORECASE,
     ),
     re.compile(
-        r"\b\d+(?:[.,]\d+)?[.,]{0,3}\s*(?:ngàn|nghìn|vnđ|vnd)\b(?:\s*/\s*(?:1\s*)?(?:m2|m²|tháng|th|t\b))?",
+        r"\b\d+(?:[.,]\d+)?[.,]{0,3}\s*(?:ngàn|nghìn|vnđ|vnd)\b(?!\s+" + _COUNT_NOUN + r")(?:\s*/\s*(?:1\s*)?(?:m2|m²|tháng|th|t\b))?",
         re.IGNORECASE,
     ),
     # Colloquial "quanh 6, đồng" or explicit >=4-digit "50000 đồng" / "3000đ/m2" (never matches "1181 Đ Lê Văn Lương" or "đường 6, Đồng Mai")
@@ -67,12 +80,15 @@ _MASK_PATTERNS = [
         re.IGNORECASE,
     ),
     re.compile(
+        r"\b\d{4,}đ\b", re.IGNORECASE,
+    ),
+    re.compile(
         r"\b\d+(?:[.,]\d+)?[.,]{0,3}\s*k\s*/\s*(?:m2|m²|tháng|th|ngày)\b",
         re.IGNORECASE,
     ),
     # Written money words: "một tỷ rưỡi", "hai tỷ ba", "năm trăm triệu", "tỷ rưỡi"
     re.compile(
-        r"\b(?:một|hai|ba|bốn|tư|năm|sáu|bảy|bẩy|tám|chín|mười)?\s*(?:tỷ|tỉ|ty)\s+(?:rưỡi|một|hai|ba|bốn|tư|năm|lăm|sáu|bảy|tám|chín)\b",
+        r"\b(?:(?:" + _NUMW + r"\s+)+)?(?:tỷ|tỉ|ty)\s+(?:rưỡi|một|hai|ba|bốn|tư|năm|lăm|sáu|bảy|tám|chín)\b(?!\s+(?:phòng|tầng|lầu)\b)",
         re.IGNORECASE,
     ),
     # Spoken compounds: "hai mươi triệu", "ba trăm năm mươi triệu", "một chục triệu", "trăm triệu"
@@ -107,7 +123,8 @@ def _bare_price_like(s: str, m: re.Match[str]) -> bool:
 # Residual detector. Written separately from `_MASK_PATTERNS` and deliberately broader: it flags digit+unit forms
 # directly, so a form the masker misses is still caught here (it must not share the masker's blind spots).
 _RESIDUAL_MONEY_RE = re.compile(
-    r"(?:\b\d+(?:[.,]?\d*)?[.,]{0,3}(?:[xX]+)?\s*(?:tỷ|tỉ|ty|tỏi|triệu|trieu|tr|củ(?!\s+chi\b)|ngàn|nghìn|vnđ|vnd)\b(?:\s*/\s*(?:1\s*)?(?:m2|m²|tháng|th|t\b))?|"
+    r"(?:\b\d+(?:[.,]?\d*)?[.,]{0,3}(?:[xX]+)?\s*(?:tỷ|tỉ|ty|tỏi|triệu|trieu|tr|củ(?!\s+chi\b)|(?:ngàn|nghìn)(?!\s+" + _COUNT_NOUN + r")|vnđ|vnd)\b(?:\s*/\s*(?:1\s*)?(?:m2|m²|tháng|th|t\b))?|"
+    r"\b\d{4,}đ\b|\b\d+(?:[.,]\d+)?\s*k\s*/\s*(?:m[2²]|tháng|th|ngày)\b|"
     r"\b\d+(?:[.,]?\d*)?[.,]{0,3}\s*ti(?!\s*(?:vi|le|lệ)\b)\b|"
     r"\b\d+(?:[.,]?\d*)?[.,]{0,3}[xX]+\s*đồng\b|"
     r"\b(?:quanh|tầm|chỉ|khoảng|giá|nhỉnh|từ|dưới|trên)\s+\d+(?:[.,]\d*)?[.,]{0,3}\s*đồng\b|"
@@ -119,10 +136,11 @@ _RESIDUAL_MONEY_RE = re.compile(
 )
 
 _MONEY_HINT_RE = re.compile(
-    r"(?:tỷ|tỉ|ty|tỏi|ti\b|triệu|trieu|tr|củ|ngàn|nghìn|vnđ|vnd|đồng|k\s*/|\d\s*đ\b|\d[.,]{0,3}[xX]+\b|\d[.,]\d{3}[.,]\d{3})",
+    r"(?:giá|tỷ|tỉ|ty|tỏi|ti\b|triệu|trieu|tr|củ|ngàn|nghìn|vnđ|vnd|đồng|k\s*/|\d\s*đ\b|\d[.,]{0,3}[xX]+\b|\d[.,]\d{3}[.,]\d{3})",
     re.IGNORECASE,
 )
 _CUE_X_PRICE_RE = re.compile(r"(\b(?:giá|chỉ|tầm|nhỉnh|từ|quanh|khoảng)\s+)\d+(?:[.,]?\d*)?[.,]{0,3}[xX]{1,3}\b", re.IGNORECASE)
+_JOINED_UNIT_PRICE_RE = re.compile(r"(/\s*(?:m[2²]|tháng|th|t))(?=\d+(?:[.,]\d+)?\s*(?:triệu|trieu|tr|tỷ|tỉ|đồng)\b)", re.I)
 
 
 def mask_money_text(text: Any, token: str = "MASK_GIA") -> str:
@@ -132,18 +150,29 @@ def mask_money_text(text: Any, token: str = "MASK_GIA") -> str:
         return ""
     if not _MONEY_HINT_RE.search(s):
         return s
+    s = _JOINED_UNIT_PRICE_RE.sub(r"\1 ", s)
     for pat in _MASK_PATTERNS:
         if _MONEY_HINT_RE.search(s):
             if r"(\b(?:quanh|" in pat.pattern:
                 s = pat.sub(rf"\1{token} ", s)
             else:
-                s = pat.sub(f" {token} ", s)
+                if pat is _MASK_PATTERNS[0]:
+                    s = pat.sub(lambda m: m.group() if _NON_PRICE_PREFIX.search(s[:m.start()]) else f" {token} ", s)
+                else:
+                    s = pat.sub(f" {token} ", s)
     if "x" in s or "X" in s:
         s = _CUE_X_PRICE_RE.sub(rf"\1{token} ", s)
     src = s
     s = _BARE_GROUPED_RE.sub(lambda m: f" {token} " if _bare_price_like(src, m) else m.group(0), src)
+    s = _IMPLICIT_PRICE_RE.sub(lambda m: m["cue"] + token + " ", s)
     if token in s:
-        s = re.sub(rf"\b{re.escape(token)}{_TRAILING_WORDS}", f" {token} ", s)
+        # The upper bound may be a bare VND amount that acquired its token only in the last pass.
+        s = re.sub(
+            rf"(?<![\w²])\d+(?:[.,]\d+)?\s*(?:-|–|—|~|đến|tới)\s*(?={re.escape(token)}\b)",
+            lambda m: m.group() if _NON_PRICE_PREFIX.search(s[:m.start()]) else "",
+            s, flags=re.IGNORECASE,
+        )
+        s = re.sub(rf"\b{re.escape(token)}{_TRAILING_WORDS}", f" {token} ", s, flags=re.IGNORECASE)
         s = re.sub(rf"(?:\b{re.escape(token)}\b\s*){{2,}}", f"{token} ", s)
         s = re.sub(r"\s+", " ", s).strip()
     return s
@@ -155,10 +184,12 @@ def find_leaked_money(text: Any, token: str = "MASK_GIA") -> list[str]:
     if not s:
         return []
     hits = [m.group(0).strip() for m in _RESIDUAL_MONEY_RE.finditer(s)]
+    hits.extend(m.group() for m in _IMPLICIT_PRICE_RE.finditer(s))
     hits += [m.group(0) for m in _BARE_GROUPED_RE.finditer(s) if _bare_price_like(s, m)]
     # Range lower bound left next to the token: "6- MASK_GIA", "từ 6 đến MASK_GIA"
     # (digit must start its own token: "80m2 - MASK_GIA", "G2- MASK_GIA" are area/block then a price, not a range)
-    hits += [m.group(0) for m in re.finditer(rf"(?<![\w²])\d+(?:[.,]\d+)?\s*(?:-|–|—|~|đến|tới)\s*{re.escape(token)}", s, re.IGNORECASE)]
+    hits += [m.group(0) for m in re.finditer(rf"(?<![\w²])\d+(?:[.,]\d+)?\s*(?:-|–|—|~|đến|tới)\s*{re.escape(token)}", s, re.IGNORECASE)
+             if not _NON_PRICE_PREFIX.search(s[:m.start()])]
     # Dangling words after the token: "MASK_GIA rưỡi", "MASK_GIA trăm"
     hits += [m.group(0) for m in re.finditer(rf"\b{re.escape(token)}{_TRAILING_WORDS}", s, re.IGNORECASE)]
     return hits

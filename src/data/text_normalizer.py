@@ -7,6 +7,8 @@ import re
 import unicodedata
 from typing import Any
 
+import pandas as pd
+
 
 _HTML_BREAK_RE = re.compile(r"</?(?:br|p|div|li|tr|h[1-6])\b[^>]*>", re.IGNORECASE)
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
@@ -24,24 +26,15 @@ _CONTACT_NAME_RE = re.compile(
 )
 _PERSON_NAME_RE = re.compile(r"(?i:\b(?:anh|chị|chú|cô|bác|ông|bà)\b)\s+[A-ZĐÀ-Ỹ][\wÀ-ỹ]+")
 _HOUSE_NUM_RE = re.compile(
-    r"\b(?:nhà\s+)?số\s+\d+(?:/\d+){1,4}\b|\b\d+/\d+(?:/\d+)?(?=\s+(?:đường|phố|ngõ|hẻm|khu|p\.|phường))",
+    r"\b(?:nhà\s+)?số\s+\d+(?:/\d+){1,4}\b|\b(?:nhà\s+)?số\s+\d+[a-z]?(?=\s+(?:đường|phố|ngõ|hẻm)\b)|"
+    r"\b\d+/\d+(?:/\d+)?(?=\s+(?:đường|phố|ngõ|hẻm|khu|p\.|phường))",
     re.IGNORECASE,
 )
 
 
-def _is_missing(value: Any) -> bool:
-    if value is None:
-        return True
-    try:
-        # Handles float('nan'), np.nan, pd.NA safely without forcing pandas import
-        return value != value
-    except Exception:
-        return False
-
-
 def normalize_text(text: Any) -> str:
     """Normalize HTML entities/tags, Unicode NFC, and whitespace."""
-    if _is_missing(text):
+    if not isinstance(text, str) and pd.api.types.is_scalar(text) and pd.isna(text):
         return ""
     s = str(text)
     s = html.unescape(s)

@@ -43,8 +43,8 @@ class M0GroupMedianModel:
             for idx, row in g2[g2["count"] >= self.min_group_samples].iterrows()
         }
 
-        g3 = work.groupby("ptype")["ppm2"].median()
-        self.lvl3_map = {str(idx): float(val) for idx, val in g3.items()}
+        g3 = work.groupby("ptype")["ppm2"].agg(["median", "count"])
+        self.lvl3_map = g3.loc[g3["count"] >= self.min_group_samples, "median"].to_dict()
         return self
 
     def predict(self, df: pd.DataFrame) -> np.ndarray:

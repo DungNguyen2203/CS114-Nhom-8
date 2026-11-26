@@ -74,6 +74,33 @@ def test_scenario_a_keeps_earliest_duplicate_and_chronological_splits():
     assert set(man_a[man_a["split"] == "test"]["month"]).issubset(set(split_cfg["test_months"]))
 
 
+def test_dedup_uses_full_text_and_confirms_lsh_candidates(monkeypatch, tmp_path):
+    from src.data.dedup import deduplicate_parquet
+
+    df = _make_sample_clean_df().iloc[[0, 0, 0]].copy().reset_index(drop=True)
+    df["row_id"] = ["a", "b", "c"]
+    prefix = "phân lô " * 60
+    df["text_masked"] = [prefix + "nhà cạnh chợ", prefix + "biệt thự ven hồ", prefix + "nhà cạnh chợ"]
+    # An LSH collision is only a candidate; force one with a very different suffix.
+    monkeypatch.setattr("src.data.dedup.MinHashLSH.query", lambda self, mh: [0] if len(self.keys) else [])
+    direct = assign_duplicate_groups(df)
+    assert direct[0] != direct[1]
+    assert direct[0] == direct[2]
+    path = tmp_path / "clean.parquet"
+    df.to_parquet(path, index=False)
+    disk = deduplicate_parquet(path, list(df), 0.85, 64, 3).set_index("row_id")
+    assert disk.at["a", "dup_group_id"] == disk.at["c", "dup_group_id"] != disk.at["b", "dup_group_id"]
+
+
+def test_stratified_sampling_advances_one_generator_for_equal_strata():
+    from src.data.splits import stratified_sample_df
+
+    frame = pd.DataFrame({"tier": np.repeat(["a", "b"], 10), "pos": list(range(10)) * 2})
+    sample = stratified_sample_df(frame, "tier", 10)
+    assert set(sample.loc[sample.tier == "a", "pos"]) != set(sample.loc[sample.tier == "b", "pos"])
+    pd.testing.assert_frame_equal(sample, stratified_sample_df(frame, "tier", 10))
+
+
 def test_scenario_b_has_zero_district_and_dup_overlap():
     df = _make_sample_clean_df()
     df["dup_group_id"] = assign_duplicate_groups(df, threshold=0.80, num_perm=64)

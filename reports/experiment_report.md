@@ -1,7 +1,7 @@
 # Báo cáo Thực nghiệm & Đánh giá (TV2–TV4)
 
-- **Profile cấu hình:** `local_smoke`
-- **Mô hình thắng trên Validation:** Kịch bản A=`M4`, Kịch bản B=`M5`
+- **Lượt chạy lịch sử** dùng `local_smoke` trước khi sửa bộ che giá và cách chọn cấu hình trên B. Các số liệu bên dưới thuộc lượt này.
+- **Mô hình có MAE_log validation thấp nhất** là M4 trên A và M0 trên B (0,551245). M5 đạt 0,565848 trên B và được dùng để tính các khoảng conformal của B trong bảng bên dưới.
 - **Kiểm tra rò rỉ split:** A=`True`, B=`True` (leaks A=0, B=0)
 
 ## 1. So sánh Mô hình Điểm (Kịch bản A & B — Test, seed chính)

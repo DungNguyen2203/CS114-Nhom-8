@@ -11,11 +11,13 @@ import pandas as pd
 
 from src.config import load_config, resolve_project_paths, set_global_seed
 from src.features.phobert_embedder import PhoBERTEmbedder
+from src.pipelines.provenance import read_prepared
 
 
 def run_extract_embeddings(cfg: dict[str, Any], paths: dict[str, Path]) -> dict[str, Any]:
     """Compute and cache PhoBERT embeddings for the union of Scenario A & B row_ids."""
     set_global_seed(int(cfg["project"]["primary_seed"]))
+    prepared = read_prepared(cfg, paths)
     splits_dir = paths["processed_dir"] / "splits"
     cache_dir = paths["processed_dir"] / "embeddings"
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -28,6 +30,7 @@ def run_extract_embeddings(cfg: dict[str, Any], paths: dict[str, Path]) -> dict[
 
     needed_cols = [
         "row_id",
+        "rules_version",
         "property_type_name",
         "province_norm",
         "district_norm",
@@ -42,6 +45,9 @@ def run_extract_embeddings(cfg: dict[str, Any], paths: dict[str, Path]) -> dict[
         if len(sub) > 0:
             parts.append(sub)
     target_df = pd.concat(parts, axis=0, ignore_index=True) if parts else pd.DataFrame(columns=needed_cols)
+    if (set(target_df["row_id"]) != union_ids or not target_df["row_id"].is_unique
+            or not target_df["rules_version"].eq(cfg["project"]["rules_version"]).fillna(False).all()):
+        raise ValueError("Clean row_id or rules_version mismatch with prepared manifests.")
     target_df = target_df.sort_values("row_id").reset_index(drop=True)
     print(f"[TV3] Extracting PhoBERT embeddings for {len(target_df):,} unique union rows...", flush=True)
 
@@ -61,6 +67,8 @@ def run_extract_embeddings(cfg: dict[str, Any], paths: dict[str, Path]) -> dict[
         cache_dir=cache_dir,
         text_version=cfg["project"]["text_version"],
         mask_token=cfg["project"]["mask_token"],
+        prepare_id=prepared["prepare_id"],
+        encoder=ph_cfg,
     )
     (cache_dir / "embedding_stats.json").write_text(json.dumps(stats, indent=2, ensure_ascii=False), encoding="utf-8")
     return stats

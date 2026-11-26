@@ -106,6 +106,22 @@ def test_m0_group_median_fallback_and_prediction_shape():
     assert np.isfinite(preds).all()
 
 
+def test_m0_min_count_applies_at_every_fallback_level():
+    train = pd.DataFrame({
+        "area": 1.0,
+        "province_norm": ["p", "p", "p", "q", "q", "q", "u"],
+        "district_norm": ["d", "d", "e", "f", "f", "g", "h"],
+        "property_type_name": ["A"] * 6 + ["B"],
+        "y_true": np.log([10., 20., 45., 70., 75., 80., 1000.]),
+    })
+    model = M0GroupMedianModel(min_group_samples=2).fit(train)
+    queries = pd.DataFrame({
+        "area": 1.0, "province_norm": ["p", "p", "v", "u"], "district_norm": ["d", "e", "z", "h"],
+        "property_type_name": ["A", "A", "A", "B"],
+    })
+    np.testing.assert_allclose(np.exp(model.predict(queries)), [15., 20., 57.5, 70.])
+
+
 def test_m1_catboost_tunes_and_trains_quantiles():
     train_df, val_df = _make_tabular_splits(n_train=140, n_val=40)
     ext = TabularFeatureExtractor(min_freq=5)

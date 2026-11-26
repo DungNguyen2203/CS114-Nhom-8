@@ -14,6 +14,8 @@ import numpy as np
 import pandas as pd
 
 from src.data.location_normalizer import LocationNormalizer
+from src.data.download import sha256_file
+from src.eval.flagger import classify_g2
 from src.data.price_area_parser import parse_listing_text, reconcile_labels
 from src.data.tabular_cleaner import clean_tabular_domain
 from src.data.text_masker import mask_money_text
@@ -173,14 +175,22 @@ class ValuationInferenceService:
     def __init__(self, bundle_dir: Path) -> None:
         self.bundle_dir = Path(bundle_dir)
         self.meta: dict[str, Any] = json.loads((self.bundle_dir / "bundle_meta.json").read_text(encoding="utf-8"))
+        for name, digest in self.meta.get("files", {}).items():
+            if sha256_file(self.bundle_dir / name) != digest:
+                raise ValueError(f"Bundle file differs from training manifest: {name}")
         self.tab_ext = joblib.load(self.bundle_dir / "tabular_extractor.joblib")
         self.point_model = CatBoostRegressor().load_model(str(self.bundle_dir / "point_model.cbm"))
         self.q_lo_model = CatBoostRegressor().load_model(str(self.bundle_dir / "q_lo_model.cbm"))
         self.q_hi_model = CatBoostRegressor().load_model(str(self.bundle_dir / "q_hi_model.cbm"))
 
-        aliases_path = Path(self.meta["aliases_path"])
-        if not aliases_path.exists():
-            aliases_path = Path(__file__).resolve().parent.parent / "configs" / "location_aliases_v1.yaml"
+        if "aliases_file" in self.meta:
+            aliases_path = self.bundle_dir / self.meta["aliases_file"]
+            if sha256_file(aliases_path) != self.meta["aliases_sha256"]:
+                raise ValueError("Location alias file does not match the trained bundle")
+        else:
+            aliases_path = Path(self.meta["aliases_path"])
+            if not aliases_path.exists():
+                aliases_path = Path(__file__).resolve().parent.parent / "configs" / "location_aliases_v1.yaml"
         self.loc_norm = LocationNormalizer(aliases_path)
         self.train_comps = pd.read_parquet(self.bundle_dir / "train_comps.parquet")
 
@@ -214,6 +224,7 @@ class ValuationInferenceService:
                 batch_size=1,
                 fp16=bool(ph_cfg.get("fp16", True)),
                 normalize_l2=bool(ph_cfg.get("normalize_l2", True)),
+                chunk_pooling=bool(ph_cfg.get("chunk_pooling", False)),
             )
         return self._phobert
 
@@ -232,7 +243,14 @@ class ValuationInferenceService:
             return []
         target_area = float(row_norm["area"]) if pd.notna(row_norm["area"]) else 60.0
         pool["_dist"] = np.abs(np.log(np.clip(pool["area"].to_numpy(dtype=float), 1.0, None)) - np.log(max(1.0, target_area)))
-        top = pool.sort_values("_dist").head(k)
+        # Break area-distance ties using available physical specs, including on older bundles.
+        pool["_spec_distance"] = 0.0
+        for feature in ("bedroom_count", "floor_count"):
+            target = row_norm.get(feature)
+            if feature in pool and pd.notna(target):
+                difference = (pd.to_numeric(pool[feature], errors="coerce") - float(target)).abs()
+                pool["_spec_distance"] += difference.fillna(difference.max() + 1).fillna(0)
+        top = pool.sort_values(["_dist", "_spec_distance", "row_id"]).head(k)
         results = []
         for _, r in top.iterrows():
             results.append(
@@ -307,7 +325,7 @@ class ValuationInferenceService:
         q_lo_raw = float(self.q_lo_model.predict(X_in)[0])
         q_hi_raw = float(self.q_hi_model.predict(X_in)[0])
         lo_s, hi_s = min(q_lo_raw, q_hi_raw), max(q_lo_raw, q_hi_raw)
-        c2_q = float(self.meta.get("c2_q", 0.0))
+        c2_q = max(float(self.meta.get("c2_q", 0.0)), 0.0)
         q_lo_c2 = lo_s - c2_q
         q_hi_c2 = hi_s + c2_q
 
@@ -319,6 +337,7 @@ class ValuationInferenceService:
         price_position = None
         parsed = parse_listing_text(name_norm, desc_norm, tabular_area=float(clean_df.loc[0, "area"]))
         text_consistency = "not_checked"
+        flag_g2 = "none"
         if asking is not None and float(asking) > 0:
             ask_log = float(np.log(float(asking)))
             if ask_log < q_lo_c2:
@@ -334,6 +353,7 @@ class ValuationInferenceService:
                 self.meta.get("reconcile_cfg", _DEFAULT_RECONCILE_CFG),  # thresholds saved with the bundle at train time
             )
             text_consistency = rec.status
+            flag_g2 = classify_g2(rec.status, rec.area_mismatch_flag)
 
         d_key = str(clean_df.loc[0, "district_key"])
         n_train_dist = int(self.district_counts.get(d_key, 0))
@@ -349,6 +369,7 @@ class ValuationInferenceService:
             "masked_text": text_masked,
             "price_position": price_position,
             "text_consistency": text_consistency,
+            "flag_g2": flag_g2,
             "district_train_count": n_train_dist,
             "low_data_warning": low_data_warning,
             "similar_listings": self._find_similar_comps(clean_df.loc[0], k=5),

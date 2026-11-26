@@ -142,13 +142,14 @@ def stratified_sample_df(
     seed: int = 42,
     id_col: str | None = "row_id",
 ) -> pd.DataFrame:
-    """Proportionally sample up to n_total rows across strata while preserving all columns."""
+    """Use a single seeded draw across strata; keep input order when all rows fit."""
     if n_total <= 0 or len(df) == 0:
         return df.iloc[0:0].copy()
     if len(df) <= n_total:
         return df.reset_index(drop=True).copy()
 
     cols = [group_cols] if isinstance(group_cols, str) else list(group_cols)
+    rng = np.random.default_rng(seed)
     frac = n_total / len(df)
     parts: list[pd.DataFrame] = []
     for _, grp in df.groupby(cols, dropna=False, sort=False):
@@ -156,11 +157,11 @@ def stratified_sample_df(
         if len(grp) <= 1 or target >= len(grp):
             parts.append(grp)
         else:
-            parts.append(grp.sample(n=target, random_state=seed))
+            parts.append(grp.sample(n=target, random_state=rng))
 
     sampled = pd.concat(parts, axis=0)
     if len(sampled) > n_total:
-        sampled = sampled.sample(n=n_total, random_state=seed)
+        sampled = sampled.sample(n=n_total, random_state=rng)
     elif len(sampled) < n_total:
         if id_col and id_col in df.columns and df[id_col].is_unique:
             rem = df[~df[id_col].isin(sampled[id_col])]
@@ -168,10 +169,10 @@ def stratified_sample_df(
             rem = df.loc[~df.index.isin(sampled.index)]
         if len(rem) > 0:
             sampled = pd.concat(
-                [sampled, rem.sample(n=min(len(rem), n_total - len(sampled)), random_state=seed)],
+                [sampled, rem.sample(n=min(len(rem), n_total - len(sampled)), random_state=rng)],
                 axis=0,
             )
-    return sampled.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    return sampled.sample(frac=1.0, random_state=rng).reset_index(drop=True)
 
 
 def apply_stratified_budget(

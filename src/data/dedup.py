@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import re
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from datasketch import MinHash, MinHashLSH
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
@@ -23,12 +27,6 @@ def _shingles(text: str, ngram_size: int = 3) -> list[str]:
     if len(tokens) <= ngram_size:
         return [text] if text else ["__EMPTY__"]
     return [" ".join(tokens[i : i + ngram_size]) for i in range(len(tokens) - ngram_size + 1)]
-
-
-def _compute_minhash(shingles: list[str], num_perm: int) -> MinHash:
-    mh = MinHash(num_perm=num_perm)
-    mh.update_batch([sh.encode("utf-8") for sh in shingles[:50]])
-    return mh
 
 
 class _UnionFind:
@@ -61,7 +59,7 @@ def assign_duplicate_groups(
         return pd.Series([], index=df.index, dtype="object")
 
     text_col = "text_masked" if "text_masked" in df.columns else "name_masked"
-    texts = [_norm_dedup_text(str(t or "")[:300]) for t in df[text_col]]
+    texts = [_norm_dedup_text(t) for t in df[text_col].fillna("").astype(str)]
     provs = df["province_norm"].fillna("__MISSING__").astype(str).tolist()
     dists = df["district_norm"].fillna("__MISSING__").astype(str).tolist()
     ptypes = df["property_type_name"].fillna("__MISSING__").astype(str).tolist()
@@ -94,19 +92,54 @@ def assign_duplicate_groups(
     for i, rep in enumerate(row_to_rep):
         uf.union(i, rep)
 
+    template = MinHashLSH(threshold=threshold, num_perm=num_perm)
+    mh = MinHash(num_perm=num_perm)
     for rep_indices in blocks.values():
         if len(rep_indices) <= 1:
             continue
-        lsh = MinHashLSH(threshold=threshold, num_perm=num_perm)
-        mh_map: dict[int, MinHash] = {}
+        lsh = MinHashLSH(num_perm=num_perm, params=(template.b, template.r))
         for idx in rep_indices:
-            sh = _shingles(texts[idx], ngram_size=ngram_size)
-            mh = _compute_minhash(sh, num_perm=num_perm)
-            mh_map[idx] = mh
-            matches = lsh.query(mh)
-            for match_key in matches:
-                uf.union(idx, int(match_key))
-            lsh.insert(str(idx), mh)
+            sh = set(_shingles(texts[idx], ngram_size))
+            mh.clear()
+            mh.update_batch([word.encode("utf-8") for word in sh])
+            for candidate in lsh.query(mh):
+                if uf.find(candidate) == uf.find(idx):
+                    continue
+                other = set(_shingles(texts[candidate], ngram_size))
+                intersection = len(sh & other)
+                if intersection >= threshold * (len(sh) + len(other) - intersection):
+                    uf.union(idx, candidate)
+            lsh.insert(idx, mh)
 
     group_ids = [f"dup_{uf.find(i):08d}" for i in range(len(df))]
     return pd.Series(group_ids, index=df.index, dtype="object")
+
+
+def deduplicate_parquet(path: Path, columns: list[str], threshold: float, num_perm: int, ngram_size: int) -> pd.DataFrame:
+    """Keep every location/type block intact while limiting full-text memory to one partition."""
+    parts = []
+    location = ["province_norm", "district_norm", "property_type_name"]
+    with TemporaryDirectory(prefix="dedup_", dir=path.parent) as tmp:
+        writers = {}
+        try:
+            for batch in pq.ParquetFile(path).iter_batches(columns=columns, batch_size=50_000):
+                frame = batch.to_pandas()
+                buckets = pd.util.hash_pandas_object(frame[location].fillna("__MISSING__"), index=False) % 64
+                for bucket, rows in frame.groupby(buckets, sort=False):
+                    dest = Path(tmp) / f"{bucket}.parquet"
+                    table = pa.Table.from_pandas(rows, preserve_index=False)
+                    if bucket not in writers:
+                        writers[bucket] = pq.ParquetWriter(dest, table.schema)
+                    writers[bucket].write_table(table)
+        finally:
+            for writer in writers.values():
+                writer.close()
+
+        for bucket in sorted(writers):
+            frame = pd.read_parquet(Path(tmp) / f"{bucket}.parquet")
+            groups = assign_duplicate_groups(frame, threshold, num_perm, ngram_size)
+            # Local representative positions refer to rows in this partition.
+            representatives = groups.str.removeprefix("dup_").astype("int64")
+            frame["dup_group_id"] = "dup_" + frame["row_id"].to_numpy()[representatives]
+            parts.append(frame.drop(columns="text_masked"))
+    return pd.concat(parts, ignore_index=True).sort_values("row_id", ignore_index=True)

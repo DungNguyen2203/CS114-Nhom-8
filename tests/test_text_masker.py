@@ -111,3 +111,39 @@ def test_redact_pii_hides_honorific_names():
     out = redact_pii("Chính chủ anh Dũng bán, nhà chú Hưng cho thuê, gặp anh Tấn")
     assert "Dũng" not in out and "Hưng" not in out and "Tấn" not in out
     assert "bán" in out
+
+
+def test_mask_implicit_currency_and_ranges_preserves_physical_numbers():
+    cases = {
+        "Giá bán: 2,85": "Giá bán: MASK_GIA",
+        "Giá: 8.8 - 9.1": "Giá: MASK_GIA",
+        "Giá 1,650 Lô 2": "Giá MASK_GIA Lô 2",
+        "8500000000đ": "MASK_GIA",
+        "Phí quản lý: 8.800 - 16.000 đ/m²": "Phí quản lý: MASK_GIA",
+        "5.8-6,x tỷ": "MASK_GIA",
+        "dt 4.3m x 15 - 18.x tỷ": "dt 4.3m x 15 - MASK_GIA",
+        "70-80 nghìn công nhân": "70-80 nghìn công nhân",
+        "Giá 70-80 m2": "Giá 70-80 m2",
+        "Giá 12.5 m²": "Giá 12.5 m²",
+        "115 triệu / m25 triệu / m2, 310 m2": "MASK_GIA , 310 m2",
+        "Tài chính tầm 500 đến 5.000.000.000": "Tài chính tầm MASK_GIA",
+        "Ngay tòa án Quận 12 - chỉ 7 đồng": "Ngay tòa án Quận 12 - MASK_GIA",
+        "Giá 8.350 LÔ ĐẤT": "Giá MASK_GIA LÔ ĐẤT",
+        "giá 2.65 căn 2 phòng ngủ": "giá MASK_GIA căn 2 phòng ngủ",
+        "5.2xxVNĐ": "MASK_GIA",
+        "1,8x VND": "MASK_GIA",
+        "HĐT: 40 triệu/th18 tỷ": "HĐT: MASK_GIA",
+        "7....tỷ": "MASK_GIA",
+        "MƯỜI MỘT TỶ BA TRĂM": "MASK_GIA",
+        "5xx nghìn/m2": "MASK_GIA",
+        "10 TỶ 5 TRĂM 60 TRIỆU": "MASK_GIA",
+        "ba tỷ hai phòng": "MASK_GIA hai phòng",
+        "thuê nguyên căn 15 - 20 triệu/tháng": "thuê nguyên căn MASK_GIA",
+        "cho thuê được luôn 2 tầng 15 - 20 triệu": "cho thuê được luôn 2 tầng MASK_GIA",
+        "rẻ hơn căn cùng diện tích 300-500 triệu": "rẻ hơn căn cùng diện tích MASK_GIA",
+    }
+    for raw, expected in cases.items():
+        assert mask_money_text(raw) == expected
+        assert not find_leaked_money(expected)
+    for raw in ("Giá bán: 2,85", "8500000000đ", "500k/m2", "thuê nguyên căn 15 - MASK_GIA"):
+        assert find_leaked_money(raw)

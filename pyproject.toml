@@ -39,3 +39,6 @@ include = ["src*", "app*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[tool.setuptools.package-data]
+"src.data" = ["dataset_lock.json"]

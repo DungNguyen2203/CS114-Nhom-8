@@ -5,12 +5,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import re
+from tempfile import TemporaryDirectory
 import time
 from typing import Any, Sequence
 import warnings
 
 import numpy as np
 import pandas as pd
+
+
+from src.pipelines.provenance import CACHE_FILES, file_hashes
 
 
 _MASK_SEG_RE = re.compile(r"MASK\s*_?\s*GIA", re.IGNORECASE)
@@ -66,26 +70,36 @@ def save_embedding_cache(
     text_version: str,
     model_sha: str,
     stats: dict[str, Any] | None = None,
+    *,
+    prepare_id: str | None = None,
+    encoder: dict | None = None,
 ) -> None:
     """Persist fp16 embeddings and an explicit `row_id -> offset` index."""
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     arr = np.asarray(embeddings, dtype=np.float16)
-    if len(row_ids) != len(arr):
-        raise ValueError(f"row_ids length ({len(row_ids)}) != embeddings length ({len(arr)})")
+    row_index = pd.Index(row_ids, dtype="string")
+    if arr.ndim != 2 or len(row_index) != len(arr) or not np.isfinite(arr).all():
+        raise ValueError("Expected a finite embedding matrix with one row per row_id.")
+    if row_index.hasnans or not row_index.is_unique:
+        raise ValueError("Embedding row_ids must be non-null and unique.")
 
-    np.save(cache_dir / "phobert_cache.fp16.npy", arr)
-    idx_df = pd.DataFrame({"row_id": [str(r) for r in row_ids], "offset": np.arange(len(row_ids), dtype=np.int64)})
-    idx_df.to_parquet(cache_dir / "phobert_index.parquet", index=False)
-
-    meta = {
-        "n_rows": len(row_ids),
-        "dim": int(arr.shape[1]) if arr.ndim == 2 else 0,
-        "text_version": text_version,
-        "model_sha": model_sha,
-        "stats": stats or {},
-    }
-    (cache_dir / "cache_meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    index = pd.DataFrame({
+        "row_id": row_index, "offset": np.arange(len(row_index), dtype=np.int64),
+        "text_version": text_version, "model_sha": model_sha,
+    })
+    with TemporaryDirectory(dir=cache_dir) as temp:
+        staged = Path(temp)
+        np.save(staged / CACHE_FILES[0], arr)
+        index.to_parquet(staged / CACHE_FILES[1], index=False)
+        meta = {
+            "n_rows": len(row_index), "dim": arr.shape[1], "text_version": text_version,
+            "model_sha": model_sha, "prepare_id": prepare_id, "encoder": encoder,
+            "files": file_hashes(staged, CACHE_FILES), "stats": stats or {},
+        }
+        (staged / "cache_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        for name in (*CACHE_FILES, "cache_meta.json"):
+            (staged / name).replace(cache_dir / name)
 
 
 def load_embeddings_for_row_ids(
@@ -98,16 +112,26 @@ def load_embeddings_for_row_ids(
     With `expected_text_version`, refuse a cache built from another masking/text version (stale embeddings).
     """
     cache_dir = Path(cache_dir)
+    metadata = json.loads((cache_dir / "cache_meta.json").read_text(encoding="utf-8"))
     if expected_text_version is not None:
-        meta_path = cache_dir / "cache_meta.json"
-        cached = json.loads(meta_path.read_text(encoding="utf-8")).get("text_version") if meta_path.exists() else None
+        cached = metadata.get("text_version")
         if cached != expected_text_version:
             raise ValueError(
                 f"PhoBERT cache text_version={cached!r} != expected {expected_text_version!r}; "
                 "re-run extract_embeddings after changing masking/text rules."
             )
     idx_df = pd.read_parquet(cache_dir / "phobert_index.parquet")
-    id_to_off = dict(zip(idx_df["row_id"].astype(str), idx_df["offset"].astype(int)))
+    arr = np.load(cache_dir / "phobert_cache.fp16.npy", mmap_mode="r")
+    if (arr.dtype != np.float16 or arr.shape != (metadata["n_rows"], metadata["dim"])
+            or len(idx_df) != len(arr)
+            or idx_df["row_id"].isna().any() or not idx_df["row_id"].is_unique
+            or not pd.api.types.is_integer_dtype(idx_df["offset"])
+            or not np.array_equal(np.sort(idx_df["offset"]), np.arange(len(arr)))):
+        raise ValueError("Invalid PhoBERT cache index, offsets or embedding dimensions.")
+    for key in ("text_version", "model_sha"):
+        if key in idx_df and not idx_df[key].eq(metadata[key]).fillna(False).all():
+            raise ValueError(f"PhoBERT cache index {key} disagrees with metadata.")
+    id_to_off = dict(zip(idx_df["row_id"].astype(str), idx_df["offset"]))
 
     offsets: list[int] = []
     missing: list[str] = []
@@ -121,7 +145,6 @@ def load_embeddings_for_row_ids(
     if missing:
         raise KeyError(f"{len(missing)} row_ids missing from PhoBERT cache, e.g. {missing[:5]}")
 
-    arr = np.load(cache_dir / "phobert_cache.fp16.npy", mmap_mode="r")
     return np.asarray(arr[offsets], dtype=np.float32)
 
 
@@ -263,6 +286,8 @@ class PhoBERTEmbedder:
         cache_dir: Path,
         text_version: str = "v1.0.0",
         mask_token: str = "MASK_GIA",
+        prepare_id: str | None = None,
+        encoder: dict | None = None,
     ) -> dict[str, Any]:
         """Format listing rows, compute embeddings, and save `row_id`-indexed cache."""
         formatted = [
@@ -283,5 +308,7 @@ class PhoBERTEmbedder:
             text_version=text_version,
             model_sha=self.revision,
             stats=stats,
+            prepare_id=prepare_id,
+            encoder=encoder,
         )
         return stats

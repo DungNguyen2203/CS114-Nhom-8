@@ -95,7 +95,11 @@ def generate_all_figures(outputs_dir: Path, splits_dir: Path) -> list[Path]:
         if len(cf) > 0:
             fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.8))
             sns.barplot(data=cf, x="method", y="coverage", hue="scenario", ax=axes[0])
-            axes[0].axhline(0.90, color="red", linestyle="--", label="Mục tiêu 90%")
+            targets = 1.0 - cf.groupby("method", sort=False)["alpha"].first()
+            for i, target in enumerate(targets):
+                axes[0].hlines(target, i - 0.4, i + 0.4, colors="red", linestyles="--",
+                               label="Mục tiêu theo alpha" if i == 0 else None)
+            axes[0].legend()
             axes[0].set_ylim(0, 1.05)
             axes[0].set_title("Độ phủ thực tế (Conformal C0–C3 & Stale Cal)")
             axes[0].tick_params(axis="x", rotation=20)

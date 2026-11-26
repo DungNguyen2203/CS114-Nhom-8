@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import pandas as pd
 from sklearn.decomposition import PCA
@@ -58,11 +60,12 @@ class M5PhoBERTCatBoostModel:
         cat_cols: list[str],
         seed: int = 42,
     ) -> float:
+        started = time.perf_counter()
         z_tr = self._fit_transform_pca(emb_tr, seed=seed)
         z_va = self._transform_pca(emb_va)
         X_tr = concat_dense_to_tabular(X_tr_tab, z_tr, "pca")
         X_va = concat_dense_to_tabular(X_va_tab, z_va, "pca")
-        model, elapsed = train_catboost_single(
+        model, _ = train_catboost_single(
             X_tr,
             y_tr,
             X_va,
@@ -76,7 +79,7 @@ class M5PhoBERTCatBoostModel:
             seed=seed,
         )
         self.point_model = model
-        return elapsed
+        return time.perf_counter() - started
 
     def predict(self, X_tab: pd.DataFrame, emb: np.ndarray) -> np.ndarray:
         if self.point_model is None:

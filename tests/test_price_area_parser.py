@@ -44,6 +44,7 @@ def test_parse_sale_ty_trieu_and_decimal():
     p2 = parse_listing_text("Nhà phố 7.45 tỷ", "DT 37m2 ngõ ô tô")
     assert p2.tx_type == "sale"
     assert abs(p2.sale_price_vnd - 7_450_000_000) < 1e3
+    assert parse_listing_text("Bán nhà 7....tỷ", "").sale_price_vnd == 7_000_000_000
 
 
 def test_parse_approx_and_unit_price_per_m2():
@@ -100,6 +101,25 @@ def test_negotiable_missing_and_bundle():
     assert p_bundle.is_bundle is True
     rec_b = reconcile_labels(18_000_000_000.0, 100.0, p_bundle, DEFAULT_DOMAIN_CFG)
     assert rec_b.bucket == "multi_or_unknown"
+
+
+def test_unambiguous_price_punctuation_negotiable_and_bundle():
+    def reconcile(text, price):
+        return reconcile_labels(price, 60., parse_listing_text(text, "", 60.), DEFAULT_DOMAIN_CFG)
+
+    assert parse_listing_text("Bán nhà 5.8..tỷ", "").sale_price_vnd == 5.8e9
+    assert parse_listing_text("Bán nhà giá 8500000000đ", "").sale_price_vnd == 8.5e9
+    assert reconcile("Bán nhà 5.8..tỷ", 50e9).bucket == "noisy"
+    assert reconcile("Bán nhà giá thỏa thuận", 6e9).bucket == "missing_or_negotiable"
+    assert reconcile("Bán đất 3 lô giá 6 tỷ", 6e9).bucket == "multi_or_unknown"
+    assert reconcile("Bán nhà. Liên hệ anh Tâm để xem nhà.", 6e9).status == "clean_no_text_price"
+
+
+def test_redact_plain_house_number_and_pandas_missing_text():
+    import pandas as pd
+    assert normalize_text(pd.NA) == ""
+    out = redact_pii("Nhà số 123 đường Ví Dụ, 4 tầng, đường rộng 6 m")
+    assert "123" not in out and "đường Ví Dụ" in out and "4 tầng" in out and "6 m" in out
 
 
 def test_area_from_dimensions_ignores_road_width():

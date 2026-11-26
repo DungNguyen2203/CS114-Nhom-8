@@ -11,6 +11,7 @@ import pandas as pd
 
 from src.config import load_config, resolve_project_paths
 from src.eval.plots import generate_all_figures
+from src.pipelines.provenance import check_cache, file_hashes, fingerprint, read_prepared, training_settings
 
 
 def run_build_reports(cfg: dict[str, Any], paths: dict[str, Path]) -> dict[str, Any]:
@@ -21,20 +22,42 @@ def run_build_reports(cfg: dict[str, Any], paths: dict[str, Path]) -> dict[str, 
     splits_dir = paths["processed_dir"] / "splits"
     reports_dir.mkdir(parents=True, exist_ok=True)
 
+    prepared = read_prepared(cfg, paths)
+    cache = check_cache(cfg, paths, prepared)
+    if "reports" in prepared and file_hashes(reports_dir, prepared["reports"]) != prepared["reports"]:
+        raise ValueError("Generated data reports do not match this preparation run.")
+    run_sum = json.loads((metrics_dir / "run_summary.json").read_text(encoding="utf-8"))
+    if (not run_sum.get("run_id") or run_sum.get("prepare_id") != prepared["prepare_id"]
+            or run_sum.get("cache_id") != fingerprint(cache)
+            or run_sum.get("training_settings") != training_settings(cfg)):
+        raise ValueError("Run summary/config/input mismatch. Re-run train_eval.")
+    for key in ("outputs_dir", "models_dir"):
+        expected = run_sum["files"][key]
+        # Audit sheets are intended for human annotations after training.
+        immutable = {name: digest for name, digest in expected.items() if not name.startswith("audits/")}
+        if file_hashes(paths[key], immutable) != immutable:
+            raise ValueError(f"Run artifact hash mismatch in {key}.")
+    meta = json.loads((paths["models_dir"] / "bundle_a/bundle_meta.json").read_text(encoding="utf-8"))
+    if meta.get("run_id") != run_sum["run_id"]:
+        raise ValueError("Bundle was produced by a different training run.")
+    for scenario in ("a", "b"):
+        val_scores = run_sum[f"val_mae_{scenario}"]
+        winner = min(val_scores, key=val_scores.get)
+        capable = [m for m in val_scores if m in ("M1", "M4", "M5")]
+        if (winner != run_sum[f"winner_{scenario}"]
+                or min(capable, key=val_scores.get) != run_sum[f"conformal_model_{scenario}"]):
+            raise ValueError(f"Validation ranking inconsistent with summary for scenario {scenario}.")
+    mc = pd.read_csv(metrics_dir / "model_comparison.csv")
+    cf = pd.read_csv(metrics_dir / "conformal_summary.csv")
+    e3 = pd.read_csv(metrics_dir / "e3_ablation.csv")
+    boot = pd.read_csv(metrics_dir / "bootstrap_ci.csv")
+    emb_stats = cache["stats"]
     figs = generate_all_figures(outputs_dir, splits_dir)
-
-    mc = pd.read_csv(metrics_dir / "model_comparison.csv") if (metrics_dir / "model_comparison.csv").exists() else pd.DataFrame()
-    cf = pd.read_csv(metrics_dir / "conformal_summary.csv") if (metrics_dir / "conformal_summary.csv").exists() else pd.DataFrame()
-    e3 = pd.read_csv(metrics_dir / "e3_ablation.csv") if (metrics_dir / "e3_ablation.csv").exists() else pd.DataFrame()
-    boot = pd.read_csv(metrics_dir / "bootstrap_ci.csv") if (metrics_dir / "bootstrap_ci.csv").exists() else pd.DataFrame()
-    emb_stats_p = paths["processed_dir"] / "embeddings" / "embedding_stats.json"
-    emb_stats = json.loads(emb_stats_p.read_text(encoding="utf-8")) if emb_stats_p.exists() else {}
-    run_sum_p = metrics_dir / "run_summary.json"
-    run_sum = json.loads(run_sum_p.read_text(encoding="utf-8")) if run_sum_p.exists() else {}
 
     lines = [
         "# Báo cáo Thực nghiệm & Đánh giá (TV2–TV4)",
         "",
+        f"- Run: `{run_sum['run_id']}` · prepare: `{prepared['prepare_id']}`",
         f"- **Profile cấu hình:** `{cfg.get('runtime', {}).get('profile_name', 'base')}`",
         f"- **Mô hình thắng trên Validation (MAE_log thấp nhất, mọi mô hình):** Kịch bản A=`{run_sum.get('winner_a', run_sum.get('winner_id', 'N/A'))}`, Kịch bản B=`{run_sum.get('winner_b', 'N/A')}`",
         f"- **Mô hình dùng cho Conformal/bundle (tốt nhất trong M1/M4/M5, có hồi quy phân vị):** A=`{run_sum.get('conformal_model_a', 'N/A')}`, B=`{run_sum.get('conformal_model_b', 'N/A')}`",

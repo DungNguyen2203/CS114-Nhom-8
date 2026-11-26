@@ -82,6 +82,9 @@ def test_valuation_inference_service_end_to_end(tmp_path):
     assert res["price_position"] in {"below_interval", "in_interval", "above_interval"}
     assert len(res["similar_listings"]) >= 1
     assert "0912345678" not in str(res["similar_listings"])
+    mismatch = svc.predict_single({"name": "Bán nhà 8.5 tỷ, 120m2", "area": 45,
+                                   "asking_price_vnd": 8_500_000_000})
+    assert mismatch["flag_g2"] == "area_mismatch"
 
 
 def test_kaggle_notebook_valid_nbformat():
@@ -94,6 +97,12 @@ def test_kaggle_notebook_valid_nbformat():
     assert "extract_embeddings" in joined
     assert "train_eval" in joined
     assert "kaggle_full.yaml" in joined
-    assert "tabulate" in joined
+    nbformat.validate(nb)
+    assert nb.metadata.kernelspec.name == "python3"
+    for cell in nb.cells:
+        if cell.cell_type == "code":
+            compile(cell.source, "kaggle_runner", "exec")
+            assert not any(line.lstrip().startswith("!") for line in cell.source.splitlines())
+    assert ".[dev]" in joined and "check=True" in joined
     pyproject_txt = Path("pyproject.toml").read_text(encoding="utf-8")
     assert "tabulate" in pyproject_txt

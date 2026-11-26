@@ -43,7 +43,10 @@ class ReconcileResult:
 
 
 _APPROX_CUE_RE = re.compile(r"\b(?:nhỉnh|hơn|tầm|khoảng|gần|chỉ\s+từ|từ)\b|~", re.IGNORECASE)
-_NEGOTIABLE_RE = re.compile(r"\b(?:giá\s+thỏa\s+thuận|thỏa\s+thuận|liên\s+hệ(?:\s+để\s+biết\s+giá)?)\b", re.IGNORECASE)
+_NEGOTIABLE_RE = re.compile(
+    r"\b(?:thỏa\s+thuận|thoả\s+thuận|giá\s*[:=]?\s*liên\s+hệ|liên\s+hệ\s+(?:để\s+biết\s+)?giá)\b",
+    re.IGNORECASE,
+)
 _SALE_CUE_RE = re.compile(
     r"\b(?:cần\s+bán|chính\s+chủ\s+bán|bán\s+gấp|bán\s+nhanh|bán\s+nhà|bán\s+đất|bán\s+căn\s+hộ|"
     r"bán\s+biệt\s+thự|bán\s+shophouse|giá\s+bán|chào\s+bán|sổ\s+đỏ|sổ\s+hồng|sang\s+tên|bán)\b",
@@ -75,13 +78,13 @@ _DISCOUNT_TO_PRICE_RE = re.compile(r"(?:giảm|hạ|còn|xuống|về)\s*[:\-]?\
 
 _BUNDLE_RE = re.compile(
     r"\b(?:bán\s+(?:cả\s+)?cặp|tổng\s+\d+\s*(?:căn|lô|nền)|"
-    r"bán\s+(?:cả\s+)?[2-9]\s*(?:căn|lô|nền)\s+(?:liền|kề|gộp|giá)|combo\s+[2-9])\b",
+    r"bán\s+(?:(?:đất|nhà|cả)\s+)*(?:[2-9]|\d{2,})\s*(?:căn|lô|nền)\b|combo\s+[2-9])\b",
     re.IGNORECASE,
 )
 
 # Fast numeric money patterns (prefix approx cues checked ONLY around matches for ~5x speedup)
 _TY_TRIEU_RE = re.compile(
-    r"(?P<ty>\d+(?:[.,]\d+)?)[.,]?\s*(?:tỷ|tỉ|ty)\s*(?P<tr_num>\d{1,3})\s*(?P<tr_unit>triệu|tr)?\b",
+    r"(?P<ty>\d+(?:[.,]\d+)?)[.,]{0,3}\s*(?:tỷ|tỉ|ty)\s*(?P<tr_num>\d{1,3})\s*(?P<tr_unit>triệu|tr)?\b",
     re.IGNORECASE,
 )
 _APPROX_X_TY_RE = re.compile(
@@ -89,7 +92,7 @@ _APPROX_X_TY_RE = re.compile(
     re.IGNORECASE,
 )
 _TY_ONLY_RE = re.compile(
-    r"(?P<ty>\d+(?:[.,]\d+)?)[.,]?\s*(?:tỷ|tỉ|ty)\b(?P<extra>\s*hơn|\s*rưỡi)?(?P<unit_sfx>\s*/\s*(?:1\s*)?(?:m2|m²|tháng|th|t\b|ngày|năm|căn|lô))?",
+    r"(?P<ty>\d+(?:[.,]\d+)?)[.,]*\s*(?:tỷ|tỉ|ty)\b(?P<extra>\s*hơn|\s*rưỡi)?(?P<unit_sfx>\s*/\s*(?:1\s*)?(?:m2|m²|tháng|th|t\b|ngày|năm|căn|lô))?",
     re.IGNORECASE,
 )
 _TRIEU_RE = re.compile(
@@ -97,7 +100,7 @@ _TRIEU_RE = re.compile(
     re.IGNORECASE,
 )
 _DONG_RE = re.compile(
-    r"\b(?P<d_val>\d+(?:[.,]\d{3})+)\s*(?:đ|đồng|vnđ|vnd)\b(?P<unit_sfx>\s*/\s*(?:1\s*)?(?:m2|m²|mét|tháng|th|t\b|ngày|năm))?",
+    r"\b(?P<d_val>\d+(?:[.,]\d{3})+|\d{5,})\s*(?:đ|đồng|vnđ|vnd)\b(?P<unit_sfx>\s*/\s*(?:1\s*)?(?:m2|m²|mét|tháng|th|t\b|ngày|năm))?",
     re.IGNORECASE,
 )
 _NON_TR_SUB_FOLLOW_RE = re.compile(r"^\s*(?:ngủ|pn|wc|vs|tầng|lầu|mặt|m2|m²|phòng|lô|căn|x\b|m\b)", re.IGNORECASE)
@@ -360,7 +363,7 @@ def reconcile_labels(
         return ReconcileResult("rental", "rental", False, None)
 
     price_missing = price is None or price != price or float(price) <= 0
-    if price_missing:
+    if price_missing or (parsed.is_negotiable and parsed.sale_price_vnd is None and parsed.unit_price_per_m2_vnd is None):
         return ReconcileResult("missing_or_negotiable", "missing_or_negotiable", False, None)
 
     if parsed.is_bundle or parsed.tx_type == "unknown":

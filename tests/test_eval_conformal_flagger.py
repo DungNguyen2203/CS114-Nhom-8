@@ -18,18 +18,19 @@ def test_verify_split_leakage_detects_overlaps():
             "district_key": ["HN|CG", "HN|HM", "HCM|Q1", "HCM|Q7"],
         }
     )
-    res = verify_split_leakage(ok, scenario="B")
+    text = ok[["row_id"]].assign(text_masked="tin sạch")
+    res = verify_split_leakage(ok, text, scenario="B")
     assert res["passed"] is True
 
     bad_dup = ok.copy()
     bad_dup.loc[3, "dup_group_id"] = "g1"
     with pytest.raises(ValueError):
-        verify_split_leakage(bad_dup, scenario="A")
+        verify_split_leakage(bad_dup, text, scenario="A")
 
     bad_dist = ok.copy()
     bad_dist.loc[3, "district_key"] = "HN|CG"
     with pytest.raises(ValueError):
-        verify_split_leakage(bad_dist, scenario="B")
+        verify_split_leakage(bad_dist, text, scenario="B")
 
 
 def test_point_and_interval_metrics_exact():
@@ -302,10 +303,28 @@ def test_crossing_rate_raw_is_measured_before_sorting():
 
 
 def test_verify_split_leakage_flags_unmasked_price_and_reports_real_pass():
-    man = pd.DataFrame({"row_id": ["a", "b"], "split": ["train", "test"], "dup_group_id": ["g1", "g2"]})
-    txt = pd.DataFrame({"row_id": ["a", "b"], "text_masked": ["Nhà đẹp giá chỉ 3.5 tỏi", "Nhà MASK_GIA"]})
-    with pytest.raises(ValueError):
+    man = pd.DataFrame({"row_id": list("abcd"), "split": ["train", "val", "cal", "test"], "dup_group_id": list("wxyz")})
+    txt = pd.DataFrame({"row_id": list("abcd"), "text_masked": ["Nhà đẹp giá chỉ 3.5 tỏi", "Nhà MASK_GIA", "", "Bán nhà"]})
+    with pytest.raises(ValueError, match="Money leakage"):
         verify_split_leakage(man, text_df=txt, scenario="A")
     res = verify_split_leakage(man, text_df=txt, scenario="A", strict_text=False)
     assert res["passed"] is False and res["leaked_money_rows"] == 1
     assert verify_split_leakage(man, text_df=txt, scenario="A", max_leak_rate=0.5)["passed"] is True
+
+
+def test_strict_leakage_requires_complete_manifest_and_text_alignment():
+    man = pd.DataFrame({"row_id": list("abcd"), "split": ["train", "val", "cal", "test"],
+                        "dup_group_id": list("wxyz"), "district_key": list("pqrs")})
+    txt = man[["row_id"]].assign(text_masked="Nhà")
+    for bad in (None, txt.drop(columns="text_masked"), txt.iloc[:3], txt.assign(row_id=list("abcc")),
+                txt.assign(row_id=list("abce")), txt.assign(text_masked=[None] * 4)):
+        with pytest.raises(ValueError):
+            verify_split_leakage(man, bad, scenario="B")
+    for bad in (man.iloc[:3], man.drop(columns="district_key"), man.drop(columns="dup_group_id"),
+                man.assign(row_id=list("abcc")), man.assign(split=["train", "val", None, "test"])):
+        with pytest.raises(ValueError):
+            verify_split_leakage(bad, txt, scenario="B")
+    txt["price"] = 6_680_000_000.
+    txt.loc[0, "text_masked"] = "Giá 6.68"
+    report = verify_split_leakage(man, txt, scenario="B", strict_text=False)
+    assert report["matched_asking_price_rows"] == report["detector_rows"] == report["leaked_money_rows"] == 1

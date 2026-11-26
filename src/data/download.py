@@ -30,11 +30,23 @@ def download_dataset_shards(
     """Download pinned parquet shards into `raw_dir` and record manifest.json."""
     raw_dir.mkdir(parents=True, exist_ok=True)
     n_shards = min(expected_shards, max_shards) if max_shards is not None else expected_shards
+    lock = json.loads(Path(__file__).with_name("dataset_lock.json").read_text(encoding="utf-8"))
+    if (repo_id, revision) == (lock["repo_id"], lock["revision"]):
+        expected = lock["sha256"]
+    else:
+        from huggingface_hub import HfApi
+
+        info = HfApi().dataset_info(repo_id, revision=revision, files_metadata=True)
+        if info.sha != revision:
+            raise ValueError("Dataset revision must be an immutable commit SHA.")
+        expected = {s.rfilename: s.lfs.sha256 for s in info.siblings if s.lfs}
 
     shards_meta: list[dict[str, Any]] = []
     total_rows = 0
     for idx in range(n_shards):
         fname = f"shard_{idx:04d}.parquet"
+        if fname not in expected:
+            raise ValueError(f"Missing upstream SHA256 for {fname} at {revision}")
         local_path = raw_dir / fname
         if not local_path.exists():
             from huggingface_hub import hf_hub_download
@@ -48,8 +60,11 @@ def download_dataset_shards(
             )
             local_path = Path(downloaded)
 
-        pf = pq.ParquetFile(local_path)
-        num_rows = int(pf.metadata.num_rows)
+        digest = sha256_file(local_path)
+        if digest != expected[fname]:
+            raise ValueError(f"SHA256 mismatch for {fname} at {repo_id}@{revision}.")
+        with pq.ParquetFile(local_path) as pf:
+            num_rows = int(pf.metadata.num_rows)
         total_rows += num_rows
         shards_meta.append(
             {
@@ -57,7 +72,7 @@ def download_dataset_shards(
                 "filename": fname,
                 "path": str(local_path),
                 "size_bytes": local_path.stat().st_size,
-                "sha256": sha256_file(local_path),
+                "sha256": digest,
                 "num_rows": num_rows,
             }
         )

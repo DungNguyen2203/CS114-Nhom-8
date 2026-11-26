@@ -21,6 +21,8 @@ class M6FineTuneRegressor:
         lr: float = 1.5e-5,
         epochs: int = 2,
         batch_size: int = 16,
+        gradient_accumulation_steps: int = 2,
+        mask_token: str = "MASK_GIA",
     ) -> None:
         self.model_name = model_name
         self.revision = revision
@@ -28,6 +30,10 @@ class M6FineTuneRegressor:
         self.lr = float(lr)
         self.epochs = int(epochs)
         self.batch_size = int(batch_size)
+        self.gradient_accumulation_steps = int(gradient_accumulation_steps)
+        if self.gradient_accumulation_steps < 1:
+            raise ValueError("gradient_accumulation_steps must be positive")
+        self.mask_token = mask_token
         self.tokenizer = None
         self.encoder = None
         self.head = None
@@ -59,8 +65,8 @@ class M6FineTuneRegressor:
         self.encoder = AutoModel.from_pretrained(self.model_name, revision=self.revision).to(self.device)
         self.head = nn.Linear(self.encoder.config.hidden_size, 1).to(self.device)
 
-        seg_tr, _ = segment_vietnamese_texts(tr_texts)
-        seg_va, _ = segment_vietnamese_texts(va_texts)
+        seg_tr, _ = segment_vietnamese_texts(tr_texts, self.mask_token)
+        seg_va, _ = segment_vietnamese_texts(va_texts, self.mask_token)
 
         enc_tr = self.tokenizer(seg_tr, max_length=self.max_length, truncation=True, padding=True, return_tensors="pt")
         enc_va = self.tokenizer(seg_va, max_length=self.max_length, truncation=True, padding=True, return_tensors="pt")
@@ -78,25 +84,31 @@ class M6FineTuneRegressor:
 
         opt = torch.optim.AdamW(list(self.encoder.parameters()) + list(self.head.parameters()), lr=self.lr)
         scaler = torch.amp.GradScaler("cuda", enabled=self.device.type == "cuda")
-        loss_fn = nn.L1Loss()
+        loss_fn = nn.L1Loss(reduction="sum")
 
         best_val_mae = float("inf")
         best_state = None
         for epoch in range(self.epochs):
             self.encoder.train()
             self.head.train()
-            for ids, mask, target in tr_loader:
+            opt.zero_grad()
+            for step, (ids, mask, target) in enumerate(tr_loader):
                 ids, mask, target = ids.to(self.device), mask.to(self.device), target.to(self.device)
-                opt.zero_grad()
+                window_start = (step // self.gradient_accumulation_steps) * self.gradient_accumulation_steps
+                # The last accumulation window can contain fewer examples.
+                window_size = min(self.batch_size * self.gradient_accumulation_steps,
+                                  len(y_tr_arr) - window_start * self.batch_size)
                 with torch.amp.autocast("cuda", dtype=torch.float16, enabled=self.device.type == "cuda"):
                     out = self.encoder(input_ids=ids, attention_mask=mask).last_hidden_state
                     m = mask.unsqueeze(-1).to(out.dtype)
                     pooled = (out * m).sum(1) / m.sum(1).clamp(min=1e-6)
                     pred = self.head(pooled).squeeze(-1)
-                    loss = loss_fn(pred, target)
+                    loss = loss_fn(pred, target) / window_size
                 scaler.scale(loss).backward()
-                scaler.step(opt)
-                scaler.update()
+                if (step + 1) % self.gradient_accumulation_steps == 0 or step + 1 == len(tr_loader):
+                    scaler.step(opt)
+                    scaler.update()
+                    opt.zero_grad()
 
             self.encoder.eval()
             self.head.eval()
@@ -113,8 +125,8 @@ class M6FineTuneRegressor:
             if val_mae < best_val_mae:
                 best_val_mae = val_mae
                 best_state = {
-                    "encoder": {k: v.cpu() for k, v in self.encoder.state_dict().items()},
-                    "head": {k: v.cpu() for k, v in self.head.state_dict().items()},
+                    "encoder": {k: v.to("cpu", copy=True) for k, v in self.encoder.state_dict().items()},
+                    "head": {k: v.to("cpu", copy=True) for k, v in self.head.state_dict().items()},
                 }
 
         if best_state is not None:
@@ -132,7 +144,7 @@ class M6FineTuneRegressor:
             raise RuntimeError("M6 model not fitted.")
         if len(texts) == 0:
             return np.zeros((0,), dtype=np.float64)
-        seg, _ = segment_vietnamese_texts(texts)
+        seg, _ = segment_vietnamese_texts(texts, self.mask_token)
         enc = self.tokenizer(seg, max_length=self.max_length, truncation=True, padding=True, return_tensors="pt")
         self.encoder.eval()
         self.head.eval()
