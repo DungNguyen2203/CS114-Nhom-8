@@ -59,6 +59,11 @@ _EMBEDDED_RENT_CTX_RE = re.compile(
     r"lợi\s+nhuận|cam\s+kết(?:\s+lợi\s+nhuận)?|\bln)\s*[:\-]?\s*$",
     re.IGNORECASE,
 )
+# A SALE listing that mentions an existing tenant ("bán nhà đang cho thuê 20tr/tháng") is not a rental ad.
+_EMBEDDED_RENT_PHRASE_RE = re.compile(
+    r"\b(?:(?:hiện\s+)?(?:đang|đã)\s+(?:được\s+)?cho\s+thuê|cho\s+thuê\s+(?:sẵn|lại)|hợp\s+đồng\s+thuê|hđt|hdt)\b",
+    re.IGNORECASE,
+)
 _RENT_UNIT_RE = re.compile(r"(?:/\s*(?:tháng|th|t|ngày|năm)\b|\b(?:tháng|th)\b)", re.IGNORECASE)
 _UNIT_M2_RE = re.compile(r"(?:/\s*(?:\d*\s*)?(?:m2|m²|mét(?:\s*vuông)?|m)\b|\b1m\b)", re.IGNORECASE)
 _DISCOUNT_OR_DEPOSIT_CTX_RE = re.compile(
@@ -302,7 +307,7 @@ def parse_listing_text(
     # A sale listing can mention rental yield (HDT / đang cho thuê X tr/th) if it also states sale cues or sale price.
     has_sale_cue = bool(_SALE_CUE_RE.search(name_norm) or _SALE_CUE_RE.search(desc_norm))
     head_text = f"{name_norm} {desc_norm[:180]}"
-    has_pure_rent_cue = bool(_PURE_RENT_CUE_RE.search(head_text))
+    has_pure_rent_cue = bool(_PURE_RENT_CUE_RE.search(_EMBEDDED_RENT_PHRASE_RE.sub(" ", head_text)))
 
     if has_pure_rent_cue and not (has_sale_cue and (sale_mentions or unit_mentions)):
         tx_type = "rent"

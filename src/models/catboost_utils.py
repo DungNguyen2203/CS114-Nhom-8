@@ -22,14 +22,18 @@ def train_catboost_single(
     iterations: int = 2000,
     early_stopping_rounds: int = 100,
     seed: int = 42,
+    eval_metric: str | None = "MAE",
 ) -> tuple[CatBoostRegressor, float]:
-    """Fit a single CatBoostRegressor on CPU and return `(model, elapsed_sec)`."""
+    """Fit a single CatBoostRegressor on CPU and return `(model, elapsed_sec)`.
+
+    `eval_metric=None` lets CatBoost evaluate (and early-stop on) the training loss itself, e.g. the Quantile loss.
+    """
     t0 = time.perf_counter()
     tr_pool = Pool(X_tr, y_tr, cat_features=cat_cols)
     va_pool = Pool(X_va, y_va, cat_features=cat_cols)
     model = CatBoostRegressor(
         loss_function=loss_function,
-        eval_metric="MAE",
+        **({"eval_metric": eval_metric} if eval_metric else {}),
         iterations=int(iterations),
         learning_rate=float(learning_rate),
         depth=int(depth),
@@ -126,6 +130,7 @@ def fit_quantile_pair(
         y_va,
         cat_cols,
         loss_function=f"Quantile:alpha={q_lo_val}",
+        eval_metric=None,
         depth=depth,
         learning_rate=learning_rate,
         iterations=iterations,
@@ -139,6 +144,7 @@ def fit_quantile_pair(
         y_va,
         cat_cols,
         loss_function=f"Quantile:alpha={q_hi_val}",
+        eval_metric=None,
         depth=depth,
         learning_rate=learning_rate,
         iterations=iterations,

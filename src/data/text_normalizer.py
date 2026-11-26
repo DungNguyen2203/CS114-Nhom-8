@@ -22,6 +22,7 @@ _CONTACT_PHONE_HINT_RE = re.compile(
 _CONTACT_NAME_RE = re.compile(
     r"(?i:\b(?:liên\s*hệ|lh|gặp)\b)\s*[:\-]?\s*(?:(?i:anh|chị|em|cô|chú|bác|mr|ms|mrs)\.?\s+)?[A-ZĐÀ-Ỹ][\wÀ-ỹ]*(?:\s+[A-ZĐÀ-Ỹ][\wÀ-ỹ]*){0,2}"
 )
+_PERSON_NAME_RE = re.compile(r"(?i:\b(?:anh|chị|chú|cô|bác|ông|bà)\b)\s+[A-ZĐÀ-Ỹ][\wÀ-ỹ]+")
 _HOUSE_NUM_RE = re.compile(
     r"\b(?:nhà\s+)?số\s+\d+(?:/\d+){1,4}\b|\b\d+/\d+(?:/\d+)?(?=\s+(?:đường|phố|ngõ|hẻm|khu|p\.|phường))",
     re.IGNORECASE,
@@ -61,6 +62,7 @@ def redact_pii(text: Any) -> str:
     s = _CONTACT_PHONE_HINT_RE.sub("LH [SĐT]", s)
     s = _PHONE_RE.sub("[SĐT]", s)
     s = _CONTACT_NAME_RE.sub("LH [LIÊN_HỆ]", s)
+    s = _PERSON_NAME_RE.sub("[TÊN]", s)
     s = _HOUSE_NUM_RE.sub("số [ĐỊA_CHỈ]", s)
     s = _MULTI_SPACE_RE.sub(" ", s).strip()
     return s

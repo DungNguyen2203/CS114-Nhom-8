@@ -22,4 +22,9 @@ $env:HF_HOME="E:\hf_cache"
 ```
 
 ### 2. Chạy Full Option A trên Kaggle GPU (T4 / P100)
-Upload repository lên Kaggle (hoặc clone từ GitHub trong Kaggle Notebook) và chạy toàn bộ các cell trong [`notebooks/kaggle_runner.ipynb`](notebooks/kaggle_runner.ipynb) với `configs/kaggle_full.yaml`. Sau khi chạy xong, tải `models/bundle_a/` và `outputs/` về thư mục dự án local để mở Streamlit demo với trọng số full.
+Bật Internet cho Kaggle Notebook rồi chạy toàn bộ các cell trong [`notebooks/kaggle_runner.ipynb`](notebooks/kaggle_runner.ipynb) với `configs/kaggle_full.yaml`: cell đầu tự `git clone` nhánh `feat/full-pipeline` (đổi bằng `VN_RE_BRANCH` / `VN_RE_REPO_URL`, hoặc tự upload repo và đặt `VN_RE_PROJECT_ROOT`). Sau khi chạy xong, tải `models/bundle_a/` và `outputs/` về thư mục dự án local để mở Streamlit demo với trọng số full.
+
+### 3. Phiên bản & chạy lại
+- Phiên bản thư viện đã kiểm thử: [`requirements-tested.txt`](requirements-tested.txt) (`pyproject.toml` chỉ ghi cận dưới).
+- Khi đổi luật ẩn giá / tách giá (`src/data/text_masker.py`, `price_area_parser.py`), tăng `rules_version` và `text_version` trong `configs/base.yaml` rồi chạy lại **cả ba bước** `prepare_data` → `extract_embeddings` → `train_eval`: `train_eval` từ chối cache embedding có `text_version` khác.
+- `train_eval` ghi `winner_a/winner_b` (MAE_log validation thấp nhất, mọi mô hình) và `conformal_model_a/b` (mô hình dùng cho conformal + bundle, chỉ M1/M4/M5 vì cần hồi quy phân vị) trong `outputs/metrics/run_summary.json`.

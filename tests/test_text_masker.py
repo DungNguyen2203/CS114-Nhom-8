@@ -64,3 +64,50 @@ def test_mask_money_handles_trailing_punctuation_single_x_and_preserves_dong_add
     assert "1181 Đ Lê Văn Lương" in masked
     assert find_leaked_money(masked) == []
 
+
+
+def test_mask_catches_slang_bare_nodiacritic_spoken_and_range_forms():
+    cases = {
+        "Giá 1.450.000.000": "1.450",
+        "GIÁ BÁN: 2.190.000.000 thương lượng": "2.190",
+        "giá chỉ :3.5 tỏi": "3.5",
+        "9,5 TỎI": "9,5",
+        "gia 5ti": "5ti",
+        "5,15ti": "5,15",
+        "800trieu": "800",
+        "hai mươi triệu": "hai mươi",
+        "ba trăm năm mươi triệu": "ba trăm",
+        "giá 6-7 tỷ": "6-",
+        "từ 6 đến 7 tỷ": "6 đến",
+        "500 - 700tr": "500",
+    }
+    for raw, forbidden in cases.items():
+        masked = mask_money_text(raw)
+        assert "MASK_GIA" in masked, raw
+        assert forbidden not in masked, (raw, masked)
+        assert find_leaked_money(masked) == [], (raw, masked)
+
+
+def test_mask_keeps_non_money_numbers_near_new_patterns():
+    for raw in [
+        "3 ti vi", "ti le xay dung 60%", "diện tích 16.000.000 m2", "LH 091.234.567", "Hotline 0523.018.708",
+        "phòng ngủ 2-3 người", "nhà 4-5 tầng", "mặt tiền 4-5m", "đường 12 - 15 m", "2 Củ Chi", "năm 2025 xây mới",
+    ]:
+        assert mask_money_text(raw) == raw, raw
+        assert find_leaked_money(raw) == [], raw
+
+
+def test_masked_leftover_words_and_checker_is_independent_of_masker():
+    assert mask_money_text("3 củ rưỡi") == "MASK_GIA"
+    assert mask_money_text("hai tỷ bốn trăm") == "MASK_GIA"
+    # The checker must flag forms on its own, not only what the masker's patterns know.
+    for raw in ["giá 3.5 tỏi", "5ti", "1.450.000.000", "6- MASK_GIA", "MASK_GIA rưỡi", "hai mươi triệu"]:
+        assert find_leaked_money(raw), raw
+
+
+def test_redact_pii_hides_honorific_names():
+    from src.data.text_normalizer import redact_pii
+
+    out = redact_pii("Chính chủ anh Dũng bán, nhà chú Hưng cho thuê, gặp anh Tấn")
+    assert "Dũng" not in out and "Hưng" not in out and "Tấn" not in out
+    assert "bán" in out

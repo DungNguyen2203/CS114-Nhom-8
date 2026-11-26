@@ -23,12 +23,12 @@ def test_verify_split_leakage_detects_overlaps():
 
     bad_dup = ok.copy()
     bad_dup.loc[3, "dup_group_id"] = "g1"
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError):
         verify_split_leakage(bad_dup, scenario="A")
 
     bad_dist = ok.copy()
     bad_dist.loc[3, "district_key"] = "HN|CG"
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError):
         verify_split_leakage(bad_dist, scenario="B")
 
 
@@ -269,3 +269,43 @@ def test_sample_error_buckets_no_duplicate_suffixes_and_redacts_pii():
     assert "property_type_name" in out.columns
     assert "0912345678" not in out.to_string()
 
+
+
+def test_finite_sample_quantile_is_exact_order_statistic():
+    import math
+
+    from src.eval.conformal import finite_sample_quantile
+
+    rng = np.random.default_rng(0)
+    for n in [9, 10, 19, 50, 99, 100, 101, 500, 1000, 6000]:
+        for a in [0.1, 0.2]:
+            s = rng.normal(size=n)
+            k = min(n, math.ceil((n + 1) * (1 - a) - 1e-12))
+            assert finite_sample_quantile(s, a) == np.sort(s)[k - 1], (n, a)
+
+
+def test_crossing_rate_raw_is_measured_before_sorting():
+    rng = np.random.default_rng(1)
+    n = 400
+    y = rng.normal(size=n)
+    q_lo = y - 0.5
+    q_hi = y + 0.5
+    cross = rng.random(n) < 0.25
+    q_lo = np.where(cross, y + 0.5, q_lo)  # swapped pair => raw crossing
+    q_hi = np.where(cross, y - 0.5, q_hi)
+    base = pd.DataFrame({"row_id": [f"r{i}" for i in range(n)], "y_true": y, "y_pred": y, "q_lo": q_lo, "q_hi": q_hi, "property_type_name": "Nhà"})
+    out = fit_apply_conformal(base, base, method="C2", alpha=0.1)
+    meta = base[["row_id", "property_type_name"]]
+    ev = evaluate_predictions_df(out, meta, alpha=0.1)
+    assert ev["overall"]["crossing_rate_raw"] == pytest.approx(cross.mean())
+    assert (out["q_lo"] <= out["q_hi"]).all()
+
+
+def test_verify_split_leakage_flags_unmasked_price_and_reports_real_pass():
+    man = pd.DataFrame({"row_id": ["a", "b"], "split": ["train", "test"], "dup_group_id": ["g1", "g2"]})
+    txt = pd.DataFrame({"row_id": ["a", "b"], "text_masked": ["Nhà đẹp giá chỉ 3.5 tỏi", "Nhà MASK_GIA"]})
+    with pytest.raises(ValueError):
+        verify_split_leakage(man, text_df=txt, scenario="A")
+    res = verify_split_leakage(man, text_df=txt, scenario="A", strict_text=False)
+    assert res["passed"] is False and res["leaked_money_rows"] == 1
+    assert verify_split_leakage(man, text_df=txt, scenario="A", max_leak_rate=0.5)["passed"] is True
